@@ -198,7 +198,7 @@ func (c *Coordinator) handleReportTaskEvent(data string) (string, error) {
 		return c.handleReportReduceTask(rn.TaskID)
 	default:
 	}
-	return "", fmt.Errorf("handle report task_type[%v] not support")
+	return "", fmt.Errorf("handle report task_type[%v] not support", rn.TaskType)
 }
 
 func (c *Coordinator) handleReportMapTask(taskID int) (string, error) {
@@ -246,7 +246,7 @@ func (c *Coordinator) handleTaskTimeoutEvent(data string) (string, error) {
 		return c.handleReduceTaskTimeout(rn.TaskID)
 	default:
 	}
-	return "", fmt.Errorf("handle timeout task_type [%v] not support")
+	return "", fmt.Errorf("handle timeout task_type[%v] not support", rn.TaskType)
 }
 
 func (c *Coordinator) handleMapTaskTimeout(taskID int) (string, error) {
@@ -312,19 +312,19 @@ func (c *Coordinator) dispatchMapTask() (string, error) {
 }
 
 func (c *Coordinator) asyncWaitTaskDone(task *TaskNode) {
-	data, _ := task.Encode()
-	go func(data string, done chan bool) {
+	go func(task *TaskNode) {
+		data, _ := task.Encode()
 		for {
 			select {
 			case <-time.After(10 * time.Second):
 				log.Printf("task_id[%v] task_type[%v] timeout, requeue\n", task.TaskID, task.TaskType)
 				c.sendEvent(EVENT_TASK_TIMEOUT, data)
 				return
-			case <-done:
+			case <-task.done:
 				return
 			}
 		}
-	}(data, task.done)
+	}(task)
 }
 
 func (c *Coordinator) dispatchRetryTask() (string, error) {
