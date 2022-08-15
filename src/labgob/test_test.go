@@ -1,8 +1,9 @@
 package labgob
 
-import "testing"
-
-import "bytes"
+import (
+	"bytes"
+	"testing"
+)
 
 type T1 struct {
 	T1int0    int
@@ -168,5 +169,27 @@ func TestDefault(t *testing.T) {
 
 	if errorCount != e0+1 {
 		t.Fatalf("failed to warn about decoding into non-default value")
+	}
+}
+
+func TestBytes(t *testing.T) {
+	type BB struct {
+		X []byte
+	}
+
+	b := BB{
+		X: []byte("hello"),
+	}
+	w := new(bytes.Buffer)
+	e := NewEncoder(w)
+	e.Encode(b)
+	data := w.Bytes()
+
+	var reply BB
+	r := bytes.NewBuffer(data)
+	d := NewDecoder(r)
+	d.Decode(&reply)
+	if string(reply.X) != string(b.X) {
+		t.Fatalf("failed to decode bytes")
 	}
 }
