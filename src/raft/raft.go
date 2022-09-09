@@ -45,10 +45,8 @@ const (
 	LEADER_NONE    = -1
 )
 
-var (
-	NotLeaderError = errors.New("raft: Not current leader")
-	StopError      = errors.New("raft: Has been stopped")
-)
+var ErrNotLeader = errors.New("raft: Not current leader")
+var ErrStopped = errors.New("raft: Has been stopped")
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -180,7 +178,7 @@ type Raft struct {
 	nextIndex  []int
 	matchIndex []int
 
-	// config
+	// raft role
 	state string
 
 	// sync control
@@ -439,18 +437,18 @@ func (r *Raft) setState(state string) {
 
 func (r *Raft) send(value interface{}) (interface{}, error) {
 	if r.killed() {
-		return nil, StopError
+		return nil, ErrStopped
 	}
 
 	e := &event{target: value, errc: make(chan error, 1)}
 	select {
 	case <-r.stopped:
-		return nil, StopError
+		return nil, ErrStopped
 	case r.c <- e:
 	}
 	select {
 	case <-r.stopped:
-		return nil, StopError
+		return nil, ErrStopped
 	case err := <-e.errc:
 		return e.returnValue, err
 	}
@@ -543,7 +541,7 @@ func (r *Raft) followerLoop() {
 			case *RequestVoteArgs:
 				e.returnValue, update = r.processRequestVoteRequest(req)
 			default:
-				err = NotLeaderError
+				err = ErrNotLeader
 			}
 			e.errc <- err
 		case <-timeoutC:
@@ -570,8 +568,7 @@ func (r *Raft) candidateLoop() {
 			term := r.voteForSelf()
 
 			// Send RequestVote RPCs to all other servers.
-			replyC = make(chan *RequestVoteReply, len(r.peers))
-			r.broadcastRequstVote(newRequestVoteArgs(term, r.me, 0, 0), replyC)
+			replyC = r.broadcastRequstVote(newRequestVoteArgs(term, r.me, 0, 0))
 
 			// Wait for either:
 			//   - Votes received from majority of servers: become leader
@@ -608,7 +605,7 @@ func (r *Raft) candidateLoop() {
 			case *RequestVoteArgs:
 				e.returnValue, _ = r.processRequestVoteRequest(req)
 			default:
-				err = NotLeaderError
+				err = ErrNotLeader
 			}
 			// Callback to caller
 			e.errc <- err
@@ -670,14 +667,15 @@ func (r *Raft) voteForSelf() int {
 	return r.currentTerm
 }
 
-func (r *Raft) broadcastRequstVote(req *RequestVoteArgs, replyC chan *RequestVoteReply) {
+func (r *Raft) broadcastRequstVote(req *RequestVoteArgs) chan *RequestVoteReply {
+	replyC := make(chan *RequestVoteReply, len(r.peers))
 	for peer := range r.peers {
 		if peer == r.me {
 			continue
 		}
 
 		r.wg.Add(1)
-		go func(peer int, req *RequestVoteArgs) {
+		go func(peer int, req *RequestVoteArgs, replyC chan<- *RequestVoteReply) {
 			defer r.wg.Done()
 
 			Debug("raft.rv.rpc.sender: server[%v] -> peer[%v] at term[%v] req[%v]", r.me, peer, r.CurrentTerm(), req)
@@ -690,8 +688,9 @@ func (r *Raft) broadcastRequstVote(req *RequestVoteArgs, replyC chan *RequestVot
 
 			Debug("raft.rv.rpc.sender: server[%v] <- peer[%v] at term[%v] reply[%v]", r.me, peer, r.CurrentTerm(), reply)
 			replyC <- &reply
-		}(peer, req)
+		}(peer, req, replyC)
 	}
+	return replyC
 }
 
 func (r *Raft) broadcastAppendEntries() {
