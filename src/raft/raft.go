@@ -40,6 +40,11 @@ const (
 	Leader    = "leader"
 )
 
+const (
+	VOTED_FOR_NONE = -1
+	LEADER_NONE    = -1
+)
+
 var (
 	NotLeaderError = errors.New("raft: Not current leader")
 	StopError      = errors.New("raft: Has been stopped")
@@ -135,8 +140,16 @@ func newRequestVoteArgs(term int, candidateId int, lastLogIndex int, lastLogTerm
 	return &RequestVoteArgs{term, candidateId, lastLogIndex, lastLogTerm}
 }
 
+func newRequestVoteReply(term int, voteGranted bool) *RequestVoteReply {
+	return &RequestVoteReply{term, voteGranted}
+}
+
 func newAppendEntriesArgs(term int, leaderId int, prevLogIndex int, prevLogTerm int, leaderCommit int, entries []*LogEntry) *AppendEntriesArgs {
 	return &AppendEntriesArgs{term, leaderId, prevLogIndex, prevLogTerm, leaderCommit, entries}
+}
+
+func newAppendEntriesReply(term int, success bool) *AppendEntriesReply {
+	return &AppendEntriesReply{term, success}
 }
 
 //
@@ -242,14 +255,49 @@ func (r *Raft) Snapshot(index int, snapshot []byte) {
 }
 
 //
-// example RequestVote RPC handler.
+// RequestVote handler request vote RPC.
 //
 func (r *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (2A, 2B).
+	resp, err := r.send(args)
+	if err != nil {
+		reply.Term = 0
+		reply.VoteGranted = false
+		Warning("raft.rv.rpc.handler: server[%v] at term[%v] send event err[%v]", r.me, r.CurrentTerm(), err)
+		return
+	}
+
+	rvReply, ok := resp.(*RequestVoteReply)
+	if !ok {
+		reply.Term = 0
+		reply.VoteGranted = false
+		Warning("raft.rv.rpc.handler: server[%v] at term[%v] type assert failed", r.me, r.CurrentTerm())
+		return
+	}
+
+	reply.Term = rvReply.Term
+	reply.VoteGranted = rvReply.VoteGranted
 }
 
+// AppendEntries handle append entries RPC
 func (r *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	resp, err := r.send(args)
+	if err != nil {
+		reply.Term = 0
+		reply.Success = false
+		Warning("raft.ae.rpc.handler: server[%v] at term[%v] send event err[%v]", r.me, r.CurrentTerm(), err)
+		return
+	}
 
+	aeReply, ok := resp.(*AppendEntriesReply)
+	if !ok {
+		reply.Term = 0
+		reply.Success = false
+		Warning("raft.ae.rpc.handler: server[%v] at term[%v] type assert failed", r.me, r.CurrentTerm())
+		return
+	}
+
+	reply.Term = aeReply.Term
+	reply.Success = aeReply.Success
 }
 
 //
@@ -368,6 +416,10 @@ func (r *Raft) Me() int {
 	return r.me
 }
 
+func (r *Raft) VotedFor() int {
+	return r.votedFor
+}
+
 func (r *Raft) QuorumSize() int {
 	return (len(r.peers) / 2) + 1
 }
@@ -456,11 +508,12 @@ func (r *Raft) stopLoop() {
 //                    |            new leader |                                     |
 //                    |_______________________|____________________________________ |
 func (r *Raft) loop() {
-	defer Info("raft.loop.end")
+	defer Info("raft.loop: server[%v] ending...", r.me)
 
 	state := r.State()
 	for state != Stopped {
-		Info("raft.loop.run %v is state %v at %v", r.me, state, r.CurrentTerm())
+		Info("raft.loop: server[%v] runing state[%v] at term[%v]", r.me, state, r.CurrentTerm())
+
 		switch state {
 		case Follower:
 			r.followerLoop()
@@ -469,6 +522,7 @@ func (r *Raft) loop() {
 		case Leader:
 			r.leaderLoop()
 		default:
+			Warning("raft.loop: server[%v] runing unknown state[%v] at term[%v]", r.me, state, r.CurrentTerm())
 		}
 		state = r.State()
 	}
@@ -480,7 +534,6 @@ func (r *Raft) followerLoop() {
 		var update bool
 		select {
 		case <-r.stopped:
-			r.setState(Stopped)
 			return
 		case e := <-r.c:
 			var err error
@@ -494,7 +547,7 @@ func (r *Raft) followerLoop() {
 			}
 			e.errc <- err
 		case <-timeoutC:
-			update = true
+			r.setState(Candidate)
 		}
 
 		// Converts to candidate if election timeout elapses without either:
@@ -507,11 +560,10 @@ func (r *Raft) followerLoop() {
 }
 
 func (r *Raft) candidateLoop() {
-	doVote := true
 	var votesGranted int
 	var replyC chan *RequestVoteReply
 	var timeoutC <-chan time.Time
-
+	doVote := true
 	for r.State() == Candidate {
 		if doVote {
 			// Increment current term, vote for self.
@@ -519,18 +571,13 @@ func (r *Raft) candidateLoop() {
 
 			// Send RequestVote RPCs to all other servers.
 			replyC = make(chan *RequestVoteReply, len(r.peers))
-			for peer, _ := range r.peers {
-				if peer == r.me {
-					continue
-				}
-				r.broadcastRequstVote(newRequestVoteArgs(term, r.me, 0, 0), replyC)
-			}
+			r.broadcastRequstVote(newRequestVoteArgs(term, r.me, 0, 0), replyC)
 
 			// Wait for either:
-			//   * Votes received from majority of servers: become leader
-			//   * AppendEntries RPC received from new leader: step down.
-			//   * Election timeout elapses without election resolution: increment term, start new election
-			//   * Discover higher term: step down (§5.1)
+			//   - Votes received from majority of servers: become leader
+			//   - AppendEntries RPC received from new leader: step down.
+			//   - Election timeout elapses without election resolution: increment term, start new election
+			//   - Discover higher term: step down (§5.1)
 			votesGranted = 1
 			timeoutC = afterBetween(DefaultElectionTimeout, 2*DefaultElectionTimeout)
 			doVote = false
@@ -539,7 +586,7 @@ func (r *Raft) candidateLoop() {
 		// If we received enough votes then stop waiting for more votes.
 		// And return from the candidate loop
 		if votesGranted == r.QuorumSize() {
-			Info("raft.candidate.vote.win")
+			Info("raft.candidate.loop: server[%v] win votes at term[%v]", r.me, r.CurrentTerm())
 			r.setState(Leader)
 			return
 		}
@@ -547,12 +594,11 @@ func (r *Raft) candidateLoop() {
 		// Collect votes from peers.
 		select {
 		case <-r.stopped:
-			r.setState(Stopped)
 			return
 		case reply := <-replyC:
-			if r.processRequestVoteResponse(reply) {
-				Info("raft.candidate.vote.granted: %v", votesGranted)
+			if r.processRequestVoteReply(reply) {
 				votesGranted++
+				Info("raft.candidate.loop: server[%v] at term[%v] recieved granted votes[%v]", r.me, r.CurrentTerm(), votesGranted)
 			}
 		case e := <-r.c:
 			var err error
@@ -574,10 +620,19 @@ func (r *Raft) candidateLoop() {
 
 func (r *Raft) leaderLoop() {
 	ticker := time.NewTicker(DefaultHeartbeatInterval)
+	defer ticker.Stop()
+
+	refreshC := make(chan bool)
+	go func() {
+		// Once a candidate wins an election, it becomes leader. It then sends heartbeat message to all of the
+		// other servers to establish its authority and prevent new elections.
+		refreshC <- true
+	}()
+
 	for r.State() == Leader {
+		var needBroadcastAppendEntries bool
 		select {
 		case <-r.stopped:
-			r.setState(Stopped)
 			return
 		case e := <-r.c:
 			var err error
@@ -585,7 +640,7 @@ func (r *Raft) leaderLoop() {
 			case *AppendEntriesArgs:
 				e.returnValue, _ = r.processAppendEntriesRequest(req)
 			case *AppendEntriesReply:
-				r.processAppendEntriesResponse(req)
+				r.processAppendEntriesReply(req)
 			case *RequestVoteArgs:
 				e.returnValue, _ = r.processRequestVoteRequest(req)
 			}
@@ -593,7 +648,15 @@ func (r *Raft) leaderLoop() {
 			// Callback
 			e.errc <- err
 		case <-ticker.C:
-			// TODO: broadcast heartbeat
+			needBroadcastAppendEntries = true
+		case <-refreshC:
+			needBroadcastAppendEntries = true
+			ticker.Reset(DefaultHeartbeatInterval)
+		}
+
+		// heartbeat broadcast append entries rpc to peers
+		if needBroadcastAppendEntries {
+			r.broadcastAppendEntries()
 		}
 	}
 }
@@ -608,47 +671,154 @@ func (r *Raft) voteForSelf() int {
 }
 
 func (r *Raft) broadcastRequstVote(req *RequestVoteArgs, replyC chan *RequestVoteReply) {
-	for peer, _ := range r.peers {
+	for peer := range r.peers {
 		if peer == r.me {
 			continue
 		}
 
 		r.wg.Add(1)
-		go func(peer int) {
+		go func(peer int, req *RequestVoteArgs) {
 			defer r.wg.Done()
 
-			Info("raft.rv.send: %v -> %v", r.me, peer)
+			Debug("raft.rv.rpc.sender: server[%v] -> peer[%v] at term[%v] req[%v]", r.me, peer, r.CurrentTerm(), req)
+
 			var reply RequestVoteReply
 			if ok := r.sendRequestVote(peer, req, &reply); !ok {
-				Warning("raft.rv.recv.failed: %v <- %v", r.me, peer)
+				Warning("raft.rv.rpc.sender: server[%v] <- peer[%v] at term[%v] failed", r.me, peer, r.CurrentTerm())
 				return
 			}
+
+			Debug("raft.rv.rpc.sender: server[%v] <- peer[%v] at term[%v] reply[%v]", r.me, peer, r.CurrentTerm(), reply)
 			replyC <- &reply
-		}(peer)
+		}(peer, req)
 	}
 }
 
 func (r *Raft) broadcastAppendEntries() {
-	// TODO: NOT IMPLEMENTED
+	req := newAppendEntriesArgs(r.CurrentTerm(), r.leader, 0, 0, 0, nil)
+	for peer := range r.peers {
+		if peer == r.me {
+			continue
+		}
+
+		r.wg.Add(1)
+		go func(peer int, req *AppendEntriesArgs) {
+			defer r.wg.Done()
+
+			Debug("raft.ae.rpc.sender: server[%v] -> peer[%v] at term[%v] req[%v]", r.me, peer, req.Term, req)
+
+			var reply AppendEntriesReply
+			if ok := r.sendAppendEntries(peer, req, &reply); !ok {
+				Warning("raft.ae.rpc.sender: server[%v] <- peer[%v] at term[%v] failed", r.me, peer, req.Term)
+				return
+			}
+
+			Debug("raft.ae.rpc.sender: server[%v] <- peer[%v] at term[%v] reply[%v]", r.me, peer, req.Term, reply)
+			r.processAppendEntriesReply(&reply)
+		}(peer, req)
+	}
 }
 
+// processAppendEntriesRequest process the append entries rpc request
 func (r *Raft) processAppendEntriesRequest(req *AppendEntriesArgs) (*AppendEntriesReply, bool) {
-	// TODO: NOT IMPLEMENTED
-	return nil, false
+	// 1. Reply false if term < currentTerm (§5.1)
+	if req.Term < r.CurrentTerm() {
+		currentTerm := r.CurrentTerm()
+		Debug("raft.ae.process.request: server[%v] at term[%v] stale", r.me, currentTerm)
+		return newAppendEntriesReply(currentTerm, false), false
+	}
+
+	if req.Term > r.CurrentTerm() {
+		r.updateCurrentTerm(req.Term, req.LeaderId)
+	} else {
+		// step-down to follower when it is a candidate
+		if r.State() == Candidate {
+			r.setState(Follower)
+		}
+
+		// discover new leader, save leader id
+		r.leader = req.LeaderId
+	}
+
+	// Reject if log doesn't contain a matching previous entry.
+
+	// Append entries to the log.
+
+	// Commit up to the commit index.
+
+	// Once the server appended and committed all the log entries from the leader
+	return newAppendEntriesReply(r.CurrentTerm(), true), true
 }
 
-func (r *Raft) processAppendEntriesResponse(resp *AppendEntriesReply) {
-	// TODO: NOT IMPLEMENTED
+// processAppendEntriesReply process the append entries rpc reply
+func (r *Raft) processAppendEntriesReply(reply *AppendEntriesReply) {
+	if reply.Term > r.CurrentTerm() {
+		r.updateCurrentTerm(reply.Term, LEADER_NONE)
+		return
+	}
+	if !reply.Success {
+		return
+	}
+
+	// TODO: commit up to the index which the majority of the members have appended
 }
 
 func (r *Raft) processRequestVoteRequest(req *RequestVoteArgs) (*RequestVoteReply, bool) {
-	// TODO: NOT IMPLEMENTED
-	return nil, false
+	// If the request is coming from an old term then reject it.
+	if req.Term < r.CurrentTerm() {
+		Debug("raft.rv.process.request: deny vote cause of stale term")
+		return newRequestVoteReply(r.CurrentTerm(), false), false
+	}
+
+	// If the term of the request peer is larger than this node, update the term
+	// If the term is equal and we've already voted for a different candidate then
+	// don't vote for this candidate
+	if req.Term > r.CurrentTerm() {
+		r.updateCurrentTerm(req.Term, LEADER_NONE)
+	} else if r.votedFor != VOTED_FOR_NONE && r.votedFor != req.CandidateId {
+		Debug("raft.rv.process.request: server[%v] already voted for[%v] at term[%v]", r.me, r.votedFor, r.CurrentTerm())
+		return newRequestVoteReply(r.CurrentTerm(), false), false
+	}
+
+	// If the candidate's log is not at least as up-to-date as our last log then don't vote.
+	// TODO:
+
+	// If we made it this far then cast a vote and reset our election time out.
+	r.votedFor = req.CandidateId
+	Info("raft.rv.process.request: server[%v] vote for[%v] at term[%v]", r.me, req.CandidateId, r.CurrentTerm())
+	return newRequestVoteReply(r.CurrentTerm(), true), true
 }
 
-func (r *Raft) processRequestVoteResponse(resp *RequestVoteReply) bool {
-	// TODO: NOT IMPLEMENTED
+// processVoteReply processes a vote request:                                                                                                                                          |+
+// 1. if the vote is granted for the current term of the candidate, return true                                                                                                          |+
+// 2. if the vote is denied due to smaller term, update the term of this server                                                                                                          |+
+//    which will also cause the candidate to step-down, and return false.                                                                                                                |+
+// 3. if the vote is for a smaller term, ignore it and return false.
+func (r *Raft) processRequestVoteReply(reply *RequestVoteReply) bool {
+	if reply.VoteGranted && reply.Term == r.CurrentTerm() {
+		return true
+	}
+
+	if reply.Term > r.CurrentTerm() {
+		r.updateCurrentTerm(reply.Term, LEADER_NONE)
+		Debug("raft.rv.process.reply: vote failed")
+	} else {
+		Debug("raft.rv.process.reply: vote denied")
+	}
 	return false
+}
+
+func (r *Raft) updateCurrentTerm(term int, leader int) {
+	_assert(term > r.CurrentTerm(), "updated term MUST be larger than current term")
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower(§5.1)
+	r.currentTerm = term
+	r.state = Follower
+	r.leader = leader
+	r.votedFor = VOTED_FOR_NONE
 }
 
 //
@@ -670,8 +840,8 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 
 	// Your initialization code here (2A, 2B, 2C).
 	r.currentTerm = 0
-	r.votedFor = -1
-	r.leader = -1
+	r.votedFor = VOTED_FOR_NONE
+	r.leader = LEADER_NONE
 	r.state = Stopped
 	r.stopped = make(chan bool)
 	r.c = make(chan *event)
