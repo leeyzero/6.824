@@ -71,12 +71,6 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
-type LogEntry struct {
-	LogIndex int
-	LogTerm  int
-	Command  interface{}
-}
-
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
@@ -127,6 +121,15 @@ type InstallSnapshotReply struct {
 	Term int
 }
 
+type CommandArgs struct {
+	Command interface{}
+}
+
+type CommandReply struct {
+	Index int
+	Term  int
+}
+
 type event struct {
 	target      interface{}
 	returnValue interface{}
@@ -150,6 +153,14 @@ func newAppendEntriesReply(term int, success bool) *AppendEntriesReply {
 	return &AppendEntriesReply{term, success}
 }
 
+func newCommandArgs(command interface{}) *CommandArgs {
+	return &CommandArgs{command}
+}
+
+func newCommandReply(index int, term int) *CommandReply {
+	return &CommandReply{index, term}
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -168,14 +179,20 @@ type Raft struct {
 	currentTerm int
 	votedFor    int
 	leader      int
-	log         []*LogEntry
+	log         *Log
 
 	// Volatile state on all servers
 	commitIndex int
 	lastApplied int
 
 	// Volatile state on leaders
-	nextIndex  []int
+
+	// for each server, index of the next log entry to send to that server.
+	// initialized to leader last log index+1
+	nextIndex []int
+
+	// for each server, index of highest log entry known to be replicated on server
+	// initialized to 0, increases monotonically
 	matchIndex []int
 
 	// raft role
@@ -359,11 +376,18 @@ func (r *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply 
 func (r *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
-	isLeader := true
 
 	// Your code here (2B).
+	resp, err := r.send(newCommandArgs(command))
+	if err != nil {
+		return index, term, false
+	}
+	cmdReply, ok := resp.(*CommandReply)
+	if !ok {
+		return index, term, false
+	}
 
-	return index, term, isLeader
+	return cmdReply.Index, cmdReply.Term, true
 }
 
 //
@@ -562,13 +586,15 @@ func (r *Raft) candidateLoop() {
 	var replyC chan *RequestVoteReply
 	var timeoutC <-chan time.Time
 	doVote := true
+
 	for r.State() == Candidate {
 		if doVote {
 			// Increment current term, vote for self.
 			term := r.voteForSelf()
 
 			// Send RequestVote RPCs to all other servers.
-			replyC = r.broadcastRequstVote(newRequestVoteArgs(term, r.me, 0, 0))
+			lastLogIndex, lastLogTerm := r.log.LastInfo()
+			replyC = r.broadcastRequstVote(newRequestVoteArgs(term, r.me, lastLogIndex, lastLogTerm))
 
 			// Wait for either:
 			//   - Votes received from majority of servers: become leader
@@ -619,12 +645,19 @@ func (r *Raft) leaderLoop() {
 	ticker := time.NewTicker(DefaultHeartbeatInterval)
 	defer ticker.Stop()
 
-	refreshC := make(chan bool)
-	go func() {
-		// Once a candidate wins an election, it becomes leader. It then sends heartbeat message to all of the
-		// other servers to establish its authority and prevent new elections.
-		refreshC <- true
-	}()
+	// After election:
+	// Reinitialized the peers nextIndex to leader's lastLogIndex+1
+	// Reinitialized the peers matchIndx to 0
+	lastLogIndex, _ := r.log.LastInfo()
+	for peer := range r.nextIndex {
+		r.nextIndex[peer] = lastLogIndex + 1
+		r.matchIndex[peer] = 0
+	}
+
+	// Once a candidate wins an election, it becomes leader. It then sends heartbeat message to all of the
+	// other servers to establish its authority and prevent new elections.
+	refreshC := make(chan bool, 1)
+	refreshC <- true
 
 	for r.State() == Leader {
 		var needBroadcastAppendEntries bool
@@ -640,6 +673,13 @@ func (r *Raft) leaderLoop() {
 				r.processAppendEntriesReply(req)
 			case *RequestVoteArgs:
 				e.returnValue, _ = r.processRequestVoteRequest(req)
+			case *CommandArgs:
+				e.returnValue, err = r.processCommandRequest(req)
+				if err == nil {
+					// 主动触发 AE RPC
+					needBroadcastAppendEntries = true
+					ticker.Reset(DefaultHeartbeatInterval)
+				}
 			}
 
 			// Callback
@@ -718,7 +758,7 @@ func (r *Raft) broadcastAppendEntries() {
 	}
 }
 
-// processAppendEntriesRequest process the append entries rpc request
+// processAppendEntriesRequest process the "append entries" rpc request
 func (r *Raft) processAppendEntriesRequest(req *AppendEntriesArgs) (*AppendEntriesReply, bool) {
 	// 1. Reply false if term < currentTerm (§5.1)
 	if req.Term < r.CurrentTerm() {
@@ -762,6 +802,7 @@ func (r *Raft) processAppendEntriesReply(reply *AppendEntriesReply) {
 	// TODO: commit up to the index which the majority of the members have appended
 }
 
+// processRequestVoteRequest process the "request vote" rpc request
 func (r *Raft) processRequestVoteRequest(req *RequestVoteArgs) (*RequestVoteReply, bool) {
 	// If the request is coming from an old term then reject it.
 	if req.Term < r.CurrentTerm() {
@@ -780,7 +821,11 @@ func (r *Raft) processRequestVoteRequest(req *RequestVoteArgs) (*RequestVoteRepl
 	}
 
 	// If the candidate's log is not at least as up-to-date as our last log then don't vote.
-	// TODO:
+	lastIndex, lastTerm := r.log.LastInfo()
+	if lastIndex > req.LastLogIndex || lastTerm > req.LastLogTerm {
+		Debug("raft.rv.process.request: server[%v] at term[%v] deny vote", r.me, r.CurrentTerm())
+		return newRequestVoteReply(r.CurrentTerm(), false), false
+	}
 
 	// If we made it this far then cast a vote and reset our election time out.
 	r.votedFor = req.CandidateId
@@ -805,6 +850,16 @@ func (r *Raft) processRequestVoteReply(reply *RequestVoteReply) bool {
 		Debug("raft.rv.process.reply: vote denied")
 	}
 	return false
+}
+
+// processCommandRequest process command request
+func (r *Raft) processCommandRequest(req *CommandArgs) (*CommandReply, error) {
+	entry := r.log.CreateEntry(r.CurrentTerm(), req.Command)
+	if err := r.log.AppendEntry(entry); err != nil {
+		return nil, err
+	}
+
+	return newCommandReply(entry.Index, entry.Term), nil
 }
 
 func (r *Raft) updateCurrentTerm(term int, leader int) {
@@ -842,6 +897,11 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	r.votedFor = VOTED_FOR_NONE
 	r.leader = LEADER_NONE
 	r.state = Stopped
+
+	r.log = NewLog(0, 0, 0, 0, nil, applyCh)
+	r.nextIndex = make([]int, len(peers))
+	r.matchIndex = make([]int, len(peers))
+
 	r.stopped = make(chan bool)
 	r.c = make(chan *event)
 
