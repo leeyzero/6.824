@@ -4,6 +4,9 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"runtime"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -17,6 +20,7 @@ const (
 
 // Debugging
 const (
+	// LogLevel = LEVEL_DEBUG
 	LogLevel = LEVEL_INFO
 )
 
@@ -69,7 +73,12 @@ func WriteLog(level int, format string, v ...interface{}) {
 	default:
 		strLevel = "DEBUG"
 	}
-	log.Printf("%s %s", strLevel, fmt.Sprintf(format, v...))
+
+	var goroutineID int64
+	if level <= LEVEL_DEBUG {
+		goroutineID = getGoroutineID()
+	}
+	log.Printf("%v %s %s", goroutineID, strLevel, fmt.Sprintf(format, v...))
 }
 
 // Waits for a random time between two durations and sends the current time on
@@ -88,4 +97,13 @@ func _assert(condition bool, msg string, v ...interface{}) {
 	if !condition {
 		panic(fmt.Sprintf("assertion failed: "+msg, v...))
 	}
+}
+
+func getGoroutineID() int64 {
+	var buf [64]byte
+	n := runtime.Stack(buf[:], false)
+	stk := strings.TrimPrefix(string(buf[:n]), "goroutine")
+	idField := strings.Fields(stk)[0]
+	id, _ := strconv.ParseInt(idField, 10, 64)
+	return id
 }
