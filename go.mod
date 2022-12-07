@@ -1,5 +1,3 @@
 module 6.824
 
-go 1.9
-
-require github.com/google/uuid v1.3.0 // indirect
+go 1.19
