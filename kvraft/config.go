@@ -4,7 +4,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/leeyzero/6.824/labrpc"
+	"6.824/labrpc"
 
 	// import "log"
 	crand "crypto/rand"
@@ -17,7 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/leeyzero/6.824/raft"
+	"6.824/raft"
 )
 
 func randstring(n int) string {

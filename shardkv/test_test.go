@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/leeyzero/6.824/models"
-	"github.com/leeyzero/6.824/porcupine"
+	"6.824/models"
+	"6.824/porcupine"
 )
 
 const linearizabilityCheckTimeout = 1 * time.Second

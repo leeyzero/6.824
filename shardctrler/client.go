@@ -9,7 +9,7 @@ import (
 	"math/big"
 	"time"
 
-	"github.com/leeyzero/6.824/labrpc"
+	"6.824/labrpc"
 )
 
 type Clerk struct {

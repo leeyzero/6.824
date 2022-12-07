@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/leeyzero/6.824/models"
-	"github.com/leeyzero/6.824/porcupine"
+	"6.824/models"
+	"6.824/porcupine"
 )
 
 // The tester generously allows solutions to complete elections in one second

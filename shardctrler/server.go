@@ -3,9 +3,9 @@ package shardctrler
 import (
 	"sync"
 
-	"github.com/leeyzero/6.824/labgob"
-	"github.com/leeyzero/6.824/labrpc"
-	"github.com/leeyzero/6.824/raft"
+	"6.824/labgob"
+	"6.824/labrpc"
+	"6.824/raft"
 )
 
 type ShardCtrler struct {

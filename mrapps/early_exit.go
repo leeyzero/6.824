@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/leeyzero/6.824/mr"
+	"6.824/mr"
 )
 
 // The map function is called once for each file of input.

@@ -17,7 +17,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/leeyzero/6.824/mr"
+	"6.824/mr"
 )
 
 var count int

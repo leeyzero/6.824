@@ -13,8 +13,8 @@ import (
 	"math/big"
 	"time"
 
-	"github.com/leeyzero/6.824/labrpc"
-	"github.com/leeyzero/6.824/shardctrler"
+	"6.824/labrpc"
+	"6.824/shardctrler"
 )
 
 // which shard is a key in?

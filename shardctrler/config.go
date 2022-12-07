@@ -4,8 +4,8 @@ import (
 	"os"
 	"testing"
 
-	"github.com/leeyzero/6.824/labrpc"
-	"github.com/leeyzero/6.824/raft"
+	"6.824/labrpc"
+	"6.824/raft"
 
 	// import "log"
 	crand "crypto/rand"

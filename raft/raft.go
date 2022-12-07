@@ -27,7 +27,7 @@ import (
 	"time"
 
 	//	"6.824/labgob"
-	"github.com/leeyzero/6.824/labrpc"
+	"6.824/labrpc"
 )
 
 const (

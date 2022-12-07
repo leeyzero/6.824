@@ -12,7 +12,7 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/leeyzero/6.824/mr"
+	"6.824/mr"
 )
 
 // The mapping function is called once for each piece of the input.
