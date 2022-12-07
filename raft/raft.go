@@ -19,6 +19,7 @@ package raft
 
 import (
 	//	"bytes"
+	"bytes"
 	"errors"
 	"fmt"
 	"sort"
@@ -27,6 +28,7 @@ import (
 	"time"
 
 	//	"6.824/labgob"
+	"6.824/labgob"
 	"6.824/labrpc"
 )
 
@@ -236,6 +238,13 @@ func (r *Raft) persist() {
 	// data := w.Bytes()
 	// r.persister.SaveRaftState(data)
 
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(r.CurrentTerm())
+	e.Encode(r.votedFor)
+	e.Encode(r.log)
+	data := w.Bytes()
+	r.persister.SaveRaftState(data)
 }
 
 // restore previously persisted state.
@@ -257,6 +266,21 @@ func (r *Raft) readPersist(data []byte) {
 	//   r.xxx = xxx
 	//   r.yyy = yyy
 	// }
+
+	var currentTerm int
+	var voteFor int
+	var log []*LogEntry
+	buf := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(buf)
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&voteFor) != nil ||
+		d.Decode(&log) != nil {
+		Warning("raft.readPersist: server[%v] at term[%v] read persist state failed", r.me, r.currentTerm)
+	} else {
+		r.currentTerm = currentTerm
+		r.votedFor = voteFor
+		r.log = log
+	}
 }
 
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
@@ -305,6 +329,8 @@ func (r *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)
 
 	reply.Term = 0
 	reply.Success = false
+	reply.LastIndex = 0
+	reply.CommitIndex = 0
 
 	resp, err := r.send(args)
 	if err != nil {
@@ -617,11 +643,11 @@ func (r *Raft) candidateLoop() {
 			return
 		}
 
-		// Collect votes from peers.
 		select {
 		case <-r.stopped:
 			return
 		case reply := <-replyC:
+			// Collect votes from peers.
 			if r.processRequestVoteReply(reply) {
 				votesGranted++
 				Info("raft.candidateLoop: server[%v] at term[%v] recieved granted votes[%v]", r.me, r.CurrentTerm(), votesGranted)
@@ -826,6 +852,9 @@ func (r *Raft) processAppendEntriesRequest(req *AppendEntriesArgs) (*AppendEntri
 		return newAppendEntriesReply(r.CurrentTerm(), false, r.currentLogIndex(), r.commitIndex), true
 	}
 
+	// save state to persist
+	r.persist()
+
 	// Once the server appended and committed all the log entries from the leader
 	return newAppendEntriesReply(r.CurrentTerm(), true, r.currentLogIndex(), r.commitIndex), true
 }
@@ -864,6 +893,9 @@ func (r *Raft) processAppendEntriesReply(peer int, req *AppendEntriesArgs, reply
 			r.nextIndex[peer] = reply.CommitIndex + 1
 		} else if r.getPrevLogIndex(peer) > 0 {
 			r.nextIndex[peer]--
+			if r.getPrevLogIndex(peer) > reply.LastIndex {
+				r.nextIndex[peer] = reply.LastIndex + 1
+			}
 		}
 	}
 	return nil
@@ -934,6 +966,9 @@ func (r *Raft) processCommandRequest(req *CommandArgs) (*CommandReply, error) {
 	// leader已完成复制，更新nextIndex和matchIndex
 	r.nextIndex[r.me] = entry.Index + 1
 	r.matchIndex[r.me] = entry.Index
+
+	// save state to persist
+	r.persist()
 
 	Debug("raft.processCommandRequest: server[%v] append log entry[%v] success, log len[%v]", r.me, entry, len(r.log))
 	return newCommandReply(entry.Index, entry.Term), nil
@@ -1040,12 +1075,21 @@ func (r *Raft) getLogEntriesAfter(index int, maxLogEntriesPerRequest int) ([]*Lo
 // at the index has not been committed.
 func (r *Raft) truncateLog(index int, term int) error {
 	// do not allow committed log entries to be truncated
+	// raft日志复制采用单身流动（leader > follower），peer在收到AE RPC后追回日志，在leader侧判断大多数peer复制成功后才提交日志，
+	// 然后会再次发起AE RPC请求，这个时候peer才会commit。由于网络请求达到的顺序是错乱的，以下情况是可能发生的：
+	// leader发起两次AE RPC请求，prevLogIndex和prevLogTerm相同，但第二个的entries比第一个长
+	// follower先收到第二个AE RPC，然后回复，leader判断大多数peer复制成功后，提交日志，并发起第三个AE RPC请求
+	// follower收到第三个AE RPC，提交日志
+	// follower收到第一个AE RPC，此时的prevLogIndex就会比commitIndex小
 	if index < r.commitIndex {
+		// Debug("server[%v] at term[%v] truncateLog index[%v] < r.commitIndex[%v]", r.me, r.CurrentTerm(), index, r.commitIndex)
 		return fmt.Errorf("index[%v] less than commmitted index[%v]", index, r.commitIndex)
 	}
 
-	// do not truncated past end of log entries
+	// do not truncated non exists log entries
+	// 这种情况发生在，重新选主后，prevLogIndex初始化为新主的lastLogIndex, 而follower在之前的term中可能只复制了很少的日志
 	if index < 0 || index > len(r.log) {
+		// Debug("server[%v] at term[%v] index[%v] > r.log len[%v]", r.me, r.CurrentTerm(), index, len(r.log))
 		return fmt.Errorf("index[%v] with term[%v] does not exist", index, term)
 	}
 
@@ -1126,14 +1170,14 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	r.stopped = make(chan bool)
 	r.c = make(chan *event)
 
-	// initialize from state persisted before a crash
-	r.readPersist(persister.ReadRaftState())
-
 	// initialize matchIndex
 	r.matchIndex = make([]int, len(peers))
 
 	// initialize nextIndex
 	r.nextIndex = make([]int, len(peers))
+
+	// initialize from state persisted before a crash
+	r.readPersist(persister.ReadRaftState())
 
 	// start loop
 	r.startLoop()
