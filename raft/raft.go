@@ -102,10 +102,11 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term        int
-	Success     bool
-	LastIndex   int
-	CommitIndex int
+	Term          int
+	Success       bool
+	CommitIndex   int
+	ConflictIndex int
+	ConflictTerm  int
 }
 
 type InstallSnapshotArgs struct {
@@ -162,8 +163,8 @@ func newAppendEntriesArgs(term int, leaderId int, prevLogIndex int, prevLogTerm 
 	return &AppendEntriesArgs{term, leaderId, prevLogIndex, prevLogTerm, leaderCommit, entries}
 }
 
-func newAppendEntriesReply(term int, success bool, lastIndex int, commitIndex int) *AppendEntriesReply {
-	return &AppendEntriesReply{term, success, lastIndex, commitIndex}
+func newAppendEntriesReply(term int, success bool, commitIndex int, conflictIndex int, conflictTerm int) *AppendEntriesReply {
+	return &AppendEntriesReply{term, success, commitIndex, conflictIndex, conflictTerm}
 }
 
 func newCommandArgs(command interface{}) *CommandArgs {
@@ -329,8 +330,9 @@ func (r *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)
 
 	reply.Term = 0
 	reply.Success = false
-	reply.LastIndex = 0
 	reply.CommitIndex = 0
+	reply.ConflictIndex = 0
+	reply.ConflictTerm = 0
 
 	resp, err := r.send(args)
 	if err != nil {
@@ -345,8 +347,9 @@ func (r *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)
 
 	reply.Term = aeReply.Term
 	reply.Success = aeReply.Success
-	reply.LastIndex = aeReply.LastIndex
 	reply.CommitIndex = aeReply.CommitIndex
+	reply.ConflictIndex = aeReply.ConflictIndex
+	reply.ConflictTerm = aeReply.ConflictTerm
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -815,7 +818,7 @@ func (r *Raft) processAppendEntriesRequest(req *AppendEntriesArgs) (*AppendEntri
 	// 1. Reply false if term < currentTerm (§5.1)
 	if req.Term < r.CurrentTerm() {
 		Info("raft.processAppendEntriesRequest: leader[%v] term[%v] staled, server[%v] current term[%v]", req.LeaderId, req.Term, r.me, r.CurrentTerm())
-		return newAppendEntriesReply(r.CurrentTerm(), false, r.currentLogIndex(), r.commitIndex), false
+		return newAppendEntriesReply(r.CurrentTerm(), false, r.commitIndex, 0, 0), false
 	}
 
 	if req.Term > r.CurrentTerm() {
@@ -835,28 +838,31 @@ func (r *Raft) processAppendEntriesRequest(req *AppendEntriesArgs) (*AppendEntri
 	}
 
 	// Reject if log doesn't contain a matching previous entry.
-	if err := r.truncateLog(req.PrevLogIndex, req.PrevLogTerm); err != nil {
-		Info("raft.processAppendEntriesRequest: server[%v] truncateLog[%v, %v] err[%v]", r.me, req.PrevLogIndex, req.PrevLogTerm, err)
-		return newAppendEntriesReply(r.CurrentTerm(), false, r.currentLogIndex(), r.commitIndex), true
+	if conflictIndex, conflictTerm, err := r.truncateLog(req.PrevLogIndex, req.PrevLogTerm); err != nil {
+		Info("raft.processAppendEntriesRequest: server[%v] truncateLog[%v %v] conflict[%v %v] err[%v]",
+			r.me, req.PrevLogIndex, req.PrevLogTerm, conflictIndex, conflictTerm, err)
+		return newAppendEntriesReply(r.CurrentTerm(), false, r.commitIndex, conflictIndex, conflictTerm), true
 	}
 
 	// Append entries to the log.
 	if err := r.appendLogEntries(req.Entries); err != nil {
 		Info("raft.processAppendEntriesRequest: server[%v] appendLogEntries[%v] err[%v]", r.me, len(req.Entries), err)
-		return newAppendEntriesReply(r.CurrentTerm(), false, r.currentLogIndex(), r.commitIndex), true
+		return newAppendEntriesReply(r.CurrentTerm(), false, r.commitIndex, r.currentLogIndex(), 0), true
+	}
+
+	// Save state to persist, skip heartbeat AE RPC
+	if len(req.Entries) > 0 {
+		r.persist()
 	}
 
 	// Commit up to the commit index.
 	if err := r.setCommitIndex(req.LeaderCommit); err != nil {
 		Info("raft.processAppendEntriesRequest: server[%v] setCommitIndex[%v] err[%v]", r.me, req.LeaderCommit, err)
-		return newAppendEntriesReply(r.CurrentTerm(), false, r.currentLogIndex(), r.commitIndex), true
+		return newAppendEntriesReply(r.CurrentTerm(), false, r.commitIndex, r.currentLogIndex(), 0), true
 	}
 
-	// save state to persist
-	r.persist()
-
 	// Once the server appended and committed all the log entries from the leader
-	return newAppendEntriesReply(r.CurrentTerm(), true, r.currentLogIndex(), r.commitIndex), true
+	return newAppendEntriesReply(r.CurrentTerm(), true, r.commitIndex, 0, 0), true
 }
 
 // processAppendEntriesReply process the append entries rpc reply
@@ -885,18 +891,24 @@ func (r *Raft) processAppendEntriesReply(peer int, req *AppendEntriesArgs, reply
 			}
 		}
 	} else if reply.Term == r.CurrentTerm() {
-		Info("raft.processAppendEntriesReply: server[%v] state[%v] at term[%v] recieved peer[%v] reply[%v] failed",
-			r.me, r.State(), r.CurrentTerm(), peer, reply)
 
 		// If AppendEntries fails because of log inconsistency: decrement nextIndex and retry(§5.3)
-		if reply.CommitIndex >= r.getPrevLogIndex(peer) {
+		prevLogIndex := r.getPrevLogIndex(peer)
+		if prevLogIndex < reply.CommitIndex {
 			r.nextIndex[peer] = reply.CommitIndex + 1
-		} else if r.getPrevLogIndex(peer) > 0 {
-			r.nextIndex[peer]--
-			if r.getPrevLogIndex(peer) > reply.LastIndex {
-				r.nextIndex[peer] = reply.LastIndex + 1
+		} else if reply.ConflictTerm > 0 {
+			termLastEntry := r.searchTermLastEntry(reply.ConflictTerm)
+			if termLastEntry != nil {
+				r.nextIndex[peer] = termLastEntry.Index + 1
+			} else {
+				r.nextIndex[peer] = reply.ConflictIndex
 			}
+		} else if reply.ConflictIndex > 0 {
+			r.nextIndex[peer] = reply.ConflictIndex
 		}
+
+		Info("raft.processAppendEntriesReply: server[%v] state[%v] at term[%v] recieved peer[%v] reply[%v] failed, peer nextIndex[%v]",
+			r.me, r.State(), r.CurrentTerm(), peer, reply, r.nextIndex[peer])
 	}
 	return nil
 }
@@ -1073,41 +1085,76 @@ func (r *Raft) getLogEntriesAfter(index int, maxLogEntriesPerRequest int) ([]*Lo
 
 // Truncates the log to the given index and term. this only works if the log
 // at the index has not been committed.
-func (r *Raft) truncateLog(index int, term int) error {
+func (r *Raft) truncateLog(index int, term int) (int, int, error) {
 	// do not allow committed log entries to be truncated
 	// raft日志复制采用单身流动（leader > follower），peer在收到AE RPC后追回日志，在leader侧判断大多数peer复制成功后才提交日志，
 	// 然后会再次发起AE RPC请求，这个时候peer才会commit。由于网络请求达到的顺序是错乱的，以下情况是可能发生的：
 	// leader发起两次AE RPC请求，prevLogIndex和prevLogTerm相同，但第二个的entries比第一个长
 	// follower先收到第二个AE RPC，然后回复，leader判断大多数peer复制成功后，提交日志，并发起第三个AE RPC请求
-	// follower收到第三个AE RPC，提交日志
+	// follower收到第三个AE RPC，提交日志，此时commitIndex为第二个AE entries的lastLogIndex
 	// follower收到第一个AE RPC，此时的prevLogIndex就会比commitIndex小
 	if index < r.commitIndex {
 		// Debug("server[%v] at term[%v] truncateLog index[%v] < r.commitIndex[%v]", r.me, r.CurrentTerm(), index, r.commitIndex)
-		return fmt.Errorf("index[%v] less than commmitted index[%v]", index, r.commitIndex)
+		return r.currentLogIndex(), 0, fmt.Errorf("index[%v] less than commmitted index[%v]", index, r.commitIndex)
 	}
 
 	// do not truncated non exists log entries
 	// 这种情况发生在，重新选主后，prevLogIndex初始化为新主的lastLogIndex, 而follower在之前的term中可能只复制了很少的日志
 	if index < 0 || index > len(r.log) {
 		// Debug("server[%v] at term[%v] index[%v] > r.log len[%v]", r.me, r.CurrentTerm(), index, len(r.log))
-		return fmt.Errorf("index[%v] with term[%v] does not exist", index, term)
+		return r.currentLogIndex(), 0, fmt.Errorf("index[%v] with term[%v] does not exist", index, term)
 	}
 
 	// truncate all
 	if index == 0 {
 		r.log = []*LogEntry{}
-		return nil
+		return 0, 0, nil
 	}
 
 	// Do not truncate if the entry at index does not have the matching term.
-	lastEntry := r.log[index-1]
-	if lastEntry.Term != term {
-		return fmt.Errorf("entry[%v %v] not match target term[%v]", index, term, lastEntry.Term)
+	entry := r.log[index-1]
+	if entry.Term != term {
+		conflictIndex := r.searchTermFirstIndex(index, entry.Term)
+		return conflictIndex, entry.Term, fmt.Errorf("entry[%v %v] not match target term[%v]", index, term, entry.Term)
 	}
 
 	// otherwise truncate the disired entry.
 	r.log = r.log[:index]
-	return nil
+	return 0, 0, nil
+}
+
+// search first log index in specified term
+func (r *Raft) searchTermFirstIndex(index int, term int) int {
+	if index <= 0 || index > len(r.log) {
+		return 0
+	}
+
+	targetIndex := r.log[index-1].Index
+	for i := index; i > 0; i-- {
+		entry := r.log[i-1]
+		if entry.Term != term {
+			break
+		}
+		targetIndex = entry.Index
+	}
+	return targetIndex
+}
+
+// search last entry in specified term, binary search right bound
+func (r *Raft) searchTermLastEntry(term int) *LogEntry {
+	lo, hi := 0, len(r.log)-1
+	for lo <= hi {
+		mid := lo + (hi-lo)/2
+		if r.log[mid].Term <= term {
+			lo = mid + 1
+		} else {
+			hi = mid - 1
+		}
+	}
+	if hi < 0 || r.log[hi].Term != term {
+		return nil
+	}
+	return r.log[hi]
 }
 
 func (r *Raft) setCommitIndex(leaderCommit int) error {
