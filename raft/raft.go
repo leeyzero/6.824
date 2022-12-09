@@ -50,7 +50,7 @@ const (
 	LEADER_NONE    = -1
 )
 
-var ErrNotLeader = errors.New("raft: Not current leader")
+var ErrUnExpectedEvent = errors.New("raft: Unexpected event")
 var ErrStopped = errors.New("raft: Has been stopped")
 
 // as each Raft peer becomes aware that successive log entries are
@@ -136,6 +136,12 @@ type LogEntry struct {
 	Index   int
 	Term    int
 	Command interface{}
+}
+
+type RequestVoteReplyEvent struct {
+	Peer  int
+	Req   *RequestVoteArgs
+	Reply *RequestVoteReply
 }
 
 type AppendEntriesReplyEvent struct {
@@ -597,7 +603,7 @@ func (r *Raft) followerLoop() {
 			case *RequestVoteArgs:
 				e.returnValue, update = r.processRequestVoteRequest(req)
 			default:
-				err = ErrNotLeader
+				err = ErrUnExpectedEvent
 			}
 			e.errc <- err
 		case <-timeoutC:
@@ -614,33 +620,31 @@ func (r *Raft) followerLoop() {
 }
 
 func (r *Raft) candidateLoop() {
-	var votesGranted int
-	var replyC chan *RequestVoteReply
 	var timeoutC <-chan time.Time
+	var term int
 	doVote := true
-
+	termVotesGranted := make(map[int]int)
 	for r.State() == Candidate {
 		if doVote {
 			// Increment current term, vote for self.
-			term := r.voteForSelf()
+			term = r.voteForSelf()
 
 			// Send RequestVote RPCs to all other servers.
-			lastLogIndex, lastLogTerm := r.lastLogInfo()
-			replyC = r.broadcastRequstVote(newRequestVoteArgs(term, r.me, lastLogIndex, lastLogTerm))
+			r.broadcastRequstVote()
 
 			// Wait for either:
 			//   - Votes received from majority of servers: become leader
 			//   - AppendEntries RPC received from new leader: step down.
 			//   - Election timeout elapses without election resolution: increment term, start new election
 			//   - Discover higher term: step down (§5.1)
-			votesGranted = 1
+			termVotesGranted[term] = 1
 			timeoutC = afterBetween(DefaultElectionTimeout, 2*DefaultElectionTimeout)
 			doVote = false
 		}
 
 		// If we received enough votes then stop waiting for more votes.
 		// And return from the candidate loop
-		if votesGranted >= r.QuorumSize() {
+		if termVotesGranted[term] >= r.QuorumSize() {
 			Info("raft.candidateLoop: server[%v] win votes at term[%v]", r.me, r.CurrentTerm())
 			r.setState(Leader)
 			return
@@ -649,12 +653,6 @@ func (r *Raft) candidateLoop() {
 		select {
 		case <-r.stopped:
 			return
-		case reply := <-replyC:
-			// Collect votes from peers.
-			if r.processRequestVoteReply(reply) {
-				votesGranted++
-				Info("raft.candidateLoop: server[%v] at term[%v] recieved granted votes[%v]", r.me, r.CurrentTerm(), votesGranted)
-			}
 		case e := <-r.c:
 			var err error
 			switch req := e.target.(type) {
@@ -662,13 +660,19 @@ func (r *Raft) candidateLoop() {
 				e.returnValue, _ = r.processAppendEntriesRequest(req)
 			case *RequestVoteArgs:
 				e.returnValue, _ = r.processRequestVoteRequest(req)
+			case *RequestVoteReplyEvent:
+				if r.processRequestVoteReply(req.Peer, req.Req, req.Reply) {
+					termVotesGranted[term]++
+					Debug("raft.candidateLoop: server[%v] at term[%v] recieved peer[%v] vote, total granted votes[%v]",
+						r.me, term, req.Peer, termVotesGranted[term])
+				}
 			default:
-				err = ErrNotLeader
+				err = ErrUnExpectedEvent
 			}
 			// Callback to caller
 			e.errc <- err
 		case <-timeoutC:
-			Info("raft.candidateLoop: server[%v] at term[%v] elect timeout redo vote", r.me, r.CurrentTerm())
+			Info("raft.candidateLoop: server[%v] at term[%v] election timeout redo vote", r.me, term)
 			doVote = true
 		}
 	}
@@ -713,6 +717,8 @@ func (r *Raft) leaderLoop() {
 					needBroadcastAppendEntries = true
 					ticker.Reset(DefaultHeartbeatInterval)
 				}
+			default:
+				err = ErrUnExpectedEvent
 			}
 
 			// Callback
@@ -744,32 +750,41 @@ func (r *Raft) getPrevLogIndex(peer int) int {
 	return r.nextIndex[peer] - 1
 }
 
-func (r *Raft) broadcastRequstVote(req *RequestVoteArgs) chan *RequestVoteReply {
-	replyC := make(chan *RequestVoteReply, len(r.peers))
+func (r *Raft) broadcastRequstVote() {
+	lastLogIndex, lastLogTerm := r.lastLogInfo()
+	req := newRequestVoteArgs(r.CurrentTerm(), r.me, lastLogIndex, lastLogTerm)
 	for peer := range r.peers {
 		if peer == r.me {
 			continue
 		}
 		if r.killed() {
-			Info("raft.broadcastRequstVote: server[%v] state[%v] at term[%v] killed", r.me, r.State(), r.CurrentTerm())
+			Info("raft.broadcastRequstVote: server[%v] state[%v] at term[%v] killed", r.me, r.State(), req.Term)
 			break
 		}
 
 		// async send RequestVote RPC
-		go func(peer int, req *RequestVoteArgs, replyC chan<- *RequestVoteReply) {
-			Debug("raft.broadcastRequstVote: server[%v] -> peer[%v] at term[%v] req[%v]", r.me, peer, r.CurrentTerm(), req)
+		go func(server int, peer int, req *RequestVoteArgs) {
+			Debug("raft.broadcastRequstVote: server[%v] -> peer[%v] req[%v]", server, peer, req)
 
 			var reply RequestVoteReply
 			if ok := r.sendRequestVote(peer, req, &reply); !ok {
-				Warning("raft.broadcastRequstVote: server[%v] -> peer[%v] at term[%v] timeout", r.me, peer, r.CurrentTerm())
+				Warning("raft.broadcastRequstVote: server[%v] -> peer[%v] timeout", server, peer)
 				return
 			}
 
-			Debug("raft.broadcastRequstVote: server[%v] <- peer[%v] at term[%v] reply[%v]", r.me, peer, r.CurrentTerm(), reply)
-			replyC <- &reply
-		}(peer, req, replyC)
+			Debug("raft.broadcastRequstVote: server[%v] <- peer[%v] reply[%v]", server, peer, reply)
+
+			// async send event to event center
+			target := &RequestVoteReplyEvent{
+				Peer:  peer,
+				Req:   req,
+				Reply: &reply,
+			}
+			if !r.sendAsync(target) {
+				Warning("raft.broadcastAppendEntries: server[%v] async send event failed", server)
+			}
+		}(r.me, peer, req)
 	}
-	return replyC
 }
 
 func (r *Raft) broadcastAppendEntries() {
@@ -789,27 +804,27 @@ func (r *Raft) broadcastAppendEntries() {
 		req := newAppendEntriesArgs(r.CurrentTerm(), r.leader, prevLogIndex, prevLogTerm, r.commitIndex, entries)
 
 		// async send AppendEntries RPC
-		go func(peer int, req *AppendEntriesArgs) {
-			Debug("raft.broadcastAppendEntries: server[%v] -> peer[%v] at term[%v] req[%v]", r.me, peer, req.Term, req)
+		go func(server int, peer int, req *AppendEntriesArgs) {
+			Debug("raft.broadcastAppendEntries: server[%v] -> peer[%v] at term[%v] req[%v]", server, peer, req.Term, req)
 
 			var reply AppendEntriesReply
 			if ok := r.sendAppendEntries(peer, req, &reply); !ok {
-				Warning("raft.broadcastAppendEntries: server[%v] -> peer[%v] at term[%v] timeout", r.me, peer, req.Term)
+				Warning("raft.broadcastAppendEntries: server[%v] -> peer[%v] at term[%v] timeout", server, peer, req.Term)
 				return
 			}
 
-			Debug("raft.broadcastAppendEntries: server[%v] <- peer[%v] at term[%v] reply[%v]", r.me, peer, req.Term, reply)
+			Debug("raft.broadcastAppendEntries: server[%v] <- peer[%v] at term[%v] reply[%v]", server, peer, req.Term, reply)
 
-			// async send event to message center
+			// async send event to event center
 			target := &AppendEntriesReplyEvent{
 				Peer:  peer,
 				Req:   req,
 				Reply: &reply,
 			}
 			if !r.sendAsync(target) {
-				Warning("raft.broadcastAppendEntries: server[%v] async send event failed", r.me)
+				Warning("raft.broadcastAppendEntries: server[%v] async send event failed", server)
 			}
-		}(peer, req)
+		}(r.me, peer, req)
 	}
 }
 
@@ -955,7 +970,7 @@ func (r *Raft) processRequestVoteRequest(req *RequestVoteArgs) (*RequestVoteRepl
 //  2. if the vote is denied due to smaller term, update the term of this server
 //     which will also cause the candidate to step-down, and return false.
 //  3. if the vote is for a smaller term, ignore it and return false.
-func (r *Raft) processRequestVoteReply(reply *RequestVoteReply) bool {
+func (r *Raft) processRequestVoteReply(peer int, req *RequestVoteArgs, reply *RequestVoteReply) bool {
 	if reply.VoteGranted && reply.Term == r.CurrentTerm() {
 		return true
 	}
