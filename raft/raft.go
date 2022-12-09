@@ -622,8 +622,8 @@ func (r *Raft) followerLoop() {
 func (r *Raft) candidateLoop() {
 	var timeoutC <-chan time.Time
 	var term int
+	var votesGranted int
 	doVote := true
-	termVotesGranted := make(map[int]int)
 	for r.State() == Candidate {
 		if doVote {
 			// Increment current term, vote for self.
@@ -637,14 +637,14 @@ func (r *Raft) candidateLoop() {
 			//   - AppendEntries RPC received from new leader: step down.
 			//   - Election timeout elapses without election resolution: increment term, start new election
 			//   - Discover higher term: step down (§5.1)
-			termVotesGranted[term] = 1
+			votesGranted = 1
 			timeoutC = afterBetween(DefaultElectionTimeout, 2*DefaultElectionTimeout)
 			doVote = false
 		}
 
 		// If we received enough votes then stop waiting for more votes.
 		// And return from the candidate loop
-		if termVotesGranted[term] >= r.QuorumSize() {
+		if votesGranted >= r.QuorumSize() {
 			Info("raft.candidateLoop: server[%v] win votes at term[%v]", r.me, r.CurrentTerm())
 			r.setState(Leader)
 			return
@@ -662,9 +662,9 @@ func (r *Raft) candidateLoop() {
 				e.returnValue, _ = r.processRequestVoteRequest(req)
 			case *RequestVoteReplyEvent:
 				if r.processRequestVoteReply(req.Peer, req.Req, req.Reply) {
-					termVotesGranted[term]++
+					votesGranted++
 					Debug("raft.candidateLoop: server[%v] at term[%v] recieved peer[%v] vote, total granted votes[%v]",
-						r.me, term, req.Peer, termVotesGranted[term])
+						r.me, term, req.Peer, votesGranted)
 				}
 			default:
 				err = ErrUnExpectedEvent
@@ -712,11 +712,11 @@ func (r *Raft) leaderLoop() {
 				e.returnValue, _ = r.processRequestVoteRequest(req)
 			case *CommandArgs:
 				e.returnValue, err = r.processCommandRequest(req)
-				if err == nil {
-					// 主动触发 AE RPC
-					needBroadcastAppendEntries = true
-					ticker.Reset(DefaultHeartbeatInterval)
-				}
+				// 取消下面注释可以主动触发 AE RPC，但从性能上考虑不用每次收到command命令都实时触发AE RPC
+				// if err == nil {
+				//	needBroadcastAppendEntries = true
+				//	ticker.Reset(DefaultHeartbeatInterval)
+				// }
 			default:
 				err = ErrUnExpectedEvent
 			}
@@ -853,7 +853,7 @@ func (r *Raft) processAppendEntriesRequest(req *AppendEntriesArgs) (*AppendEntri
 	}
 
 	// Reject if log doesn't contain a matching previous entry.
-	if conflictIndex, conflictTerm, err := r.truncateLog(req.PrevLogIndex, req.PrevLogTerm); err != nil {
+	if conflictIndex, conflictTerm, err := r.truncateLog(req.PrevLogIndex, req.PrevLogTerm, len(req.Entries)); err != nil {
 		Info("raft.processAppendEntriesRequest: server[%v] truncateLog[%v %v] conflict[%v %v] err[%v]",
 			r.me, req.PrevLogIndex, req.PrevLogTerm, conflictIndex, conflictTerm, err)
 		return newAppendEntriesReply(r.CurrentTerm(), false, r.commitIndex, conflictIndex, conflictTerm), true
@@ -918,8 +918,18 @@ func (r *Raft) processAppendEntriesReply(peer int, req *AppendEntriesArgs, reply
 			} else {
 				r.nextIndex[peer] = reply.ConflictIndex
 			}
-		} else if reply.ConflictIndex > 0 {
-			r.nextIndex[peer] = reply.ConflictIndex
+		} else {
+			conflictIndex := reply.ConflictIndex
+			if conflictIndex <= 0 {
+				// 这种情况发生在:
+				// term1: leader1复制日志到follower1
+				// term2: leader2选为主后，节点日志为空，将follower1中的日志truncate了
+				// term3: leader1再次选为主，由于nextIndex是记录term1中follower1复制的日志，follower1收到AE请求后，返回的conflictIndex将为0
+				// 此时将confictIndex重置为1，重新复制日志即可
+				conflictIndex = 1
+			}
+			r.nextIndex[peer] = conflictIndex
+
 		}
 
 		Info("raft.processAppendEntriesReply: server[%v] state[%v] at term[%v] recieved peer[%v] reply[%v] failed, peer nextIndex[%v]",
@@ -1100,7 +1110,7 @@ func (r *Raft) getLogEntriesAfter(index int, maxLogEntriesPerRequest int) ([]*Lo
 
 // Truncates the log to the given index and term. this only works if the log
 // at the index has not been committed.
-func (r *Raft) truncateLog(index int, term int) (int, int, error) {
+func (r *Raft) truncateLog(index int, term int, entriesLen int) (int, int, error) {
 	// do not allow committed log entries to be truncated
 	// raft日志复制采用单身流动（leader > follower），peer在收到AE RPC后追回日志，在leader侧判断大多数peer复制成功后才提交日志，
 	// 然后会再次发起AE RPC请求，这个时候peer才会commit。由于网络请求达到的顺序是错乱的，以下情况是可能发生的：
@@ -1114,15 +1124,19 @@ func (r *Raft) truncateLog(index int, term int) (int, int, error) {
 	}
 
 	// do not truncated non exists log entries
-	// 这种情况发生在，重新选主后，prevLogIndex初始化为新主的lastLogIndex, 而follower在之前的term中可能只复制了很少的日志
 	if index < 0 || index > len(r.log) {
 		// Debug("server[%v] at term[%v] index[%v] > r.log len[%v]", r.me, r.CurrentTerm(), index, len(r.log))
-		return r.currentLogIndex(), 0, fmt.Errorf("index[%v] with term[%v] does not exist", index, term)
+		return r.currentLogIndex(), 0, fmt.Errorf("index[%v] with term[%v] out of range[0...%v]", index, term, len(r.log))
 	}
 
-	// truncate all
+	// truncate all log entries
+	// 这种情况发生在，选出一个新leader后，leader中没有日志，发起AE RPC时，prevLogIndex=0，如果本节点已经被复制了一些日志，则这些日志会
+	// 被truncate掉
 	if index == 0 {
-		r.log = []*LogEntry{}
+		// only truncate is entries is not empty(means AE RPC is not for heartbeat)
+		if entriesLen > 0 {
+			r.log = []*LogEntry{}
+		}
 		return 0, 0, nil
 	}
 
