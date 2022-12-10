@@ -1102,10 +1102,15 @@ func (r *Raft) getLogEntriesAfter(index int, maxLogEntriesPerRequest int) ([]*Lo
 
 	targetEntry := r.log[index-1]
 	afterEntries := r.log[index:]
-	if len(afterEntries) < maxLogEntriesPerRequest {
-		return afterEntries, targetEntry.Term
+	if len(afterEntries) > maxLogEntriesPerRequest {
+		afterEntries = afterEntries[:maxLogEntriesPerRequest]
 	}
-	return afterEntries[:maxLogEntriesPerRequest], targetEntry.Term
+
+	// bug fix: if we not copy entries，cause of go slice implementation,
+	// data race condition may be occurs when multi goroutine access the slice of internal data buffer
+	dupAfterEntries := make([]*LogEntry, len(afterEntries))
+	copy(dupAfterEntries, afterEntries)
+	return dupAfterEntries, targetEntry.Term
 }
 
 // Truncates the log to the given index and term. this only works if the log
