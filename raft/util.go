@@ -20,7 +20,6 @@ const (
 
 // Debugging
 const (
-	// LogLevel = LEVEL_DEBUG
 	LogLevel = LEVEL_INFO
 )
 

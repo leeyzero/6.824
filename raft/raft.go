@@ -36,6 +36,7 @@ const (
 	DefaultHeartbeatInterval = 50 * time.Millisecond
 	DefaultElectionTimeout   = 250 * time.Millisecond
 	MaxLogEntriesPerRequest  = 2000
+	DefaultApplyQueueSize    = 1024
 )
 
 const (
@@ -114,9 +115,7 @@ type InstallSnapshotArgs struct {
 	LeaderId          int
 	LastIncludedIndex int
 	LastIncludedTerm  int
-	Offset            int
-	Data              []byte
-	Done              bool
+	Snapshot          []byte
 }
 
 type InstallSnapshotReply struct {
@@ -130,6 +129,25 @@ type CommandArgs struct {
 type CommandReply struct {
 	Index int
 	Term  int
+}
+
+type SnapshotArgs struct {
+	Index    int
+	Snapshot []byte
+}
+
+type SnapshotReply struct {
+	Success bool
+}
+
+type CondInstallSnapshotArgs struct {
+	LastIncludedTerm  int
+	LastIncludedIndex int
+	Snapshot          []byte
+}
+
+type CondInstallSnapshotReply struct {
+	Success bool
 }
 
 type LogEntry struct {
@@ -148,6 +166,12 @@ type AppendEntriesReplyEvent struct {
 	Peer  int
 	Req   *AppendEntriesArgs
 	Reply *AppendEntriesReply
+}
+
+type InstallSnapshotReplyEvent struct {
+	Peer  int
+	Req   *InstallSnapshotArgs
+	Reply *InstallSnapshotReply
 }
 
 type event struct {
@@ -181,6 +205,40 @@ func newCommandReply(index int, term int) *CommandReply {
 	return &CommandReply{index, term}
 }
 
+func newSnapshotArgs(index int, snapshot []byte) *SnapshotArgs {
+	return &SnapshotArgs{index, snapshot}
+}
+
+func newSnapshotReply(success bool) *SnapshotReply {
+	return &SnapshotReply{success}
+}
+
+func newInstallSnapshotArgs(term int, leaderId int, lastIncludedIndex int, lastIncludedTerm int, snapshot []byte) *InstallSnapshotArgs {
+	return &InstallSnapshotArgs{
+		Term:              term,
+		LeaderId:          leaderId,
+		LastIncludedIndex: lastIncludedIndex,
+		LastIncludedTerm:  lastIncludedTerm,
+		Snapshot:          snapshot,
+	}
+}
+
+func newInstallSnapshotReply(term int) *InstallSnapshotReply {
+	return &InstallSnapshotReply{term}
+}
+
+func newCondInstallSnapshotArgs(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) *CondInstallSnapshotArgs {
+	return &CondInstallSnapshotArgs{
+		LastIncludedTerm:  lastIncludedTerm,
+		LastIncludedIndex: lastIncludedIndex,
+		Snapshot:          snapshot,
+	}
+}
+
+func newCondInstallSnapshotReply(success bool) *CondInstallSnapshotReply {
+	return &CondInstallSnapshotReply{success}
+}
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -194,10 +252,13 @@ type Raft struct {
 	// state a Raft server must maintain.
 
 	// Persistent state on all servers
-	currentTerm int         // latest term server has seen
-	votedFor    int         // candidatedId that received vote in current term (or null if none)
-	log         []*LogEntry // log entries; each entry contains command for state machine, and term when entry was received by leader
-	leader      int         // leader identifier
+	currentTerm       int         // latest term server has seen
+	votedFor          int         // candidatedId that received vote in current term (or null if none)
+	lastIncludedIndex int         // the snapshot replaces all entries up through and including this index
+	lastIncludedTerm  int         // term of lastIncludedIndex
+	snapshot          []byte      // snapshot
+	log               []*LogEntry // log entries; each entry contains command for state machine, and term when entry was received by leader
+	leader            int         // leader identifier
 
 	// Volatile state on all servers
 	commitIndex int // index of highest log entry known to be committed
@@ -218,6 +279,9 @@ type Raft struct {
 
 	// apply channel
 	applyCh chan ApplyMsg
+
+	// apply queue
+	applyQueue chan ApplyMsg
 
 	// sync control
 	stopped chan bool
@@ -245,13 +309,24 @@ func (r *Raft) persist() {
 	// data := w.Bytes()
 	// r.persister.SaveRaftState(data)
 
+	state := r.dumpState()
+	r.persister.SaveRaftState(state)
+}
+
+func (r *Raft) persistStateAndSnapshot() {
+	state := r.dumpState()
+	r.persister.SaveStateAndSnapshot(state, r.snapshot)
+}
+
+func (r *Raft) dumpState() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(r.CurrentTerm())
 	e.Encode(r.votedFor)
+	e.Encode(r.lastIncludedIndex)
+	e.Encode(r.lastIncludedTerm)
 	e.Encode(r.log)
-	data := w.Bytes()
-	r.persister.SaveRaftState(data)
+	return w.Bytes()
 }
 
 // restore previously persisted state.
@@ -276,27 +351,44 @@ func (r *Raft) readPersist(data []byte) {
 
 	var currentTerm int
 	var voteFor int
+	var lastIncludedIndex int
+	var lastIncludedTerm int
 	var log []*LogEntry
 	buf := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(buf)
 	if d.Decode(&currentTerm) != nil ||
 		d.Decode(&voteFor) != nil ||
+		d.Decode(&lastIncludedIndex) != nil ||
+		d.Decode(&lastIncludedTerm) != nil ||
 		d.Decode(&log) != nil {
 		Warning("raft.readPersist: server[%v] at term[%v] read persist state failed", r.me, r.currentTerm)
 	} else {
 		r.currentTerm = currentTerm
 		r.votedFor = voteFor
+		r.lastIncludedIndex = lastIncludedIndex
+		r.lastIncludedTerm = lastIncludedTerm
 		r.log = log
+		r.commitIndex = r.lastIncludedIndex
+		r.lastApplied = r.lastIncludedIndex
+		r.snapshot = r.persister.ReadSnapshot()
 	}
 }
 
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
 // have more recent info since it communicate the snapshot on applyCh.
 func (r *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
-
 	// Your code here (2D).
-
-	return true
+	resp, err := r.send(newCondInstallSnapshotArgs(lastIncludedTerm, lastIncludedIndex, snapshot))
+	if err != nil {
+		Warning("raft.CondInstallSnapshot: send CondInstallSnapshot event err[%v]", err)
+		return false
+	}
+	reply, ok := resp.(*CondInstallSnapshotReply)
+	if !ok {
+		Warning("raft.CondInstallSnapshot: resp[%v] type assert CondInstallSnapshotReply failed", resp)
+		return false
+	}
+	return reply.Success
 }
 
 // the service says it has created a snapshot that has
@@ -306,6 +398,16 @@ func (r *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, 
 func (r *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
 
+	resp, err := r.send(newSnapshotArgs(index, snapshot))
+	if err != nil {
+		Warning("raft.Snapshot: send snapshot event err[%v]", err)
+		return
+	}
+	_, ok := resp.(*SnapshotReply)
+	if !ok {
+		Warning("raft.Snapshot: resp[%v] type assert SnapshotReply failed", resp)
+		return
+	}
 }
 
 // RequestVote handler request vote RPC.
@@ -356,6 +458,23 @@ func (r *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)
 	reply.CommitIndex = aeReply.CommitIndex
 	reply.ConflictIndex = aeReply.ConflictIndex
 	reply.ConflictTerm = aeReply.ConflictTerm
+}
+
+// InstallSnapshot handle install snapshot RPC
+func (r *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	reply.Term = 0
+
+	resp, err := r.send(args)
+	if err != nil {
+		Warning("raft.InstallSnapshot: server[%v] at term[%v] send event err[%v]", r.me, r.CurrentTerm(), err)
+		return
+	}
+	insReply, ok := resp.(*InstallSnapshotReply)
+	if !ok {
+		Warning("raft.InstallSnapshot: server[%v] at term[%v] type assert failed", r.me, r.CurrentTerm())
+	}
+
+	reply.Term = insReply.Term
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -542,6 +661,15 @@ func (r *Raft) startLoop() {
 	go func() {
 		defer r.wg.Done()
 		r.loop()
+
+		// only loop exit, we can close applyQueue channel
+		close(r.applyQueue)
+	}()
+
+	r.wg.Add(1)
+	go func() {
+		defer r.wg.Done()
+		r.applyLoop()
 	}()
 }
 
@@ -553,20 +681,6 @@ func (r *Raft) stopLoop() {
 	Info("raft.stopLoop: server[%v] state[%v] at term[%v] stopped", r.me, r.State(), r.CurrentTerm())
 }
 
-//	   ________
-//	--|Snapshot|                 timeout
-//	|  --------                  ______
-//
-// recover    |       ^                   |      |
-// snapshot / |       |snapshot           |      |
-// higher     |       |                   v      |     recv majority votes
-// term       |    --------    timeout    -----------                        -----------
-//
-//	|-> |Follower| ----------> | Candidate |--------------------> |  Leader   |
-//	     --------               -----------                        -----------
-//	        ^          higher term/ |                         higher term |
-//	        |            new leader |                                     |
-//	        |_______________________|____________________________________ |
 func (r *Raft) loop() {
 	state := r.State()
 	for state != Stopped {
@@ -602,6 +716,15 @@ func (r *Raft) followerLoop() {
 				e.returnValue, update = r.processAppendEntriesRequest(req)
 			case *RequestVoteArgs:
 				e.returnValue, update = r.processRequestVoteRequest(req)
+			case *SnapshotArgs:
+				e.returnValue, update = r.processSnapshot(req), true
+			case *InstallSnapshotArgs:
+				e.returnValue, update = r.processInstallSnapshotRequest(req)
+			case *CondInstallSnapshotArgs:
+				e.returnValue, update = r.processCondInstallSnapshotRequest(req), true
+			case *ApplyMsg:
+				r.processApplyMsg(req)
+				update = true
 			default:
 				err = ErrUnExpectedEvent
 			}
@@ -688,7 +811,7 @@ func (r *Raft) leaderLoop() {
 	lastLogIndex, _ := r.lastLogInfo()
 	for peer := range r.nextIndex {
 		r.nextIndex[peer] = lastLogIndex + 1
-		r.matchIndex[peer] = 0
+		r.matchIndex[peer] = r.lastIncludedIndex
 	}
 
 	// Once a candidate wins an election, it becomes leader. It then sends heartbeat message to all of the
@@ -717,6 +840,12 @@ func (r *Raft) leaderLoop() {
 				//	needBroadcastAppendEntries = true
 				//	ticker.Reset(DefaultHeartbeatInterval)
 				// }
+			case *SnapshotArgs:
+				e.returnValue = r.processSnapshot(req)
+			case *InstallSnapshotReplyEvent:
+				err = r.processInstallSnapshotReply(req.Peer, req.Req, req.Reply)
+			case *ApplyMsg:
+				r.processApplyMsg(req)
 			default:
 				err = ErrUnExpectedEvent
 			}
@@ -733,6 +862,16 @@ func (r *Raft) leaderLoop() {
 		// heartbeat broadcast append entries rpc to peers
 		if needBroadcastAppendEntries {
 			r.broadcastAppendEntries()
+		}
+	}
+}
+
+func (r *Raft) applyLoop() {
+	Info("raft.applyLoop: server[%v] start apply loop", r.me)
+	for msg := range r.applyQueue {
+		r.applyCh <- msg
+		if !r.sendAsync(msg) {
+			Warning("raft.applyLoop: async send apply msg failed")
 		}
 	}
 }
@@ -798,34 +937,64 @@ func (r *Raft) broadcastAppendEntries() {
 		}
 
 		prevLogIndex := r.getPrevLogIndex(peer)
-
-		// If last log index >= nextIndex for a follower send AppendEntries RPC with log entries starting at nextIndex
-		entries, prevLogTerm := r.getLogEntriesAfter(prevLogIndex, MaxLogEntriesPerRequest)
-		req := newAppendEntriesArgs(r.CurrentTerm(), r.leader, prevLogIndex, prevLogTerm, r.commitIndex, entries)
-
-		// async send AppendEntries RPC
-		go func(server int, peer int, req *AppendEntriesArgs) {
-			Debug("raft.broadcastAppendEntries: server[%v] -> peer[%v] at term[%v] req[%v]", server, peer, req.Term, req)
-
-			var reply AppendEntriesReply
-			if ok := r.sendAppendEntries(peer, req, &reply); !ok {
-				Warning("raft.broadcastAppendEntries: server[%v] -> peer[%v] at term[%v] timeout", server, peer, req.Term)
-				return
-			}
-
-			Debug("raft.broadcastAppendEntries: server[%v] <- peer[%v] at term[%v] reply[%v]", server, peer, req.Term, reply)
-
-			// async send event to event center
-			target := &AppendEntriesReplyEvent{
-				Peer:  peer,
-				Req:   req,
-				Reply: &reply,
-			}
-			if !r.sendAsync(target) {
-				Warning("raft.broadcastAppendEntries: server[%v] async send event failed", server)
-			}
-		}(r.me, peer, req)
+		if prevLogIndex >= r.lastIncludedIndex {
+			// If last log index >= nextIndex for a follower send AppendEntries RPC with log entries starting at nextIndex
+			entries, prevLogTerm := r.getLogEntriesAfter(prevLogIndex, MaxLogEntriesPerRequest)
+			req := newAppendEntriesArgs(r.CurrentTerm(), r.leader, prevLogIndex, prevLogTerm, r.commitIndex, entries)
+			r.asyncSendAppendEntries(r.me, peer, req)
+		} else {
+			req := newInstallSnapshotArgs(r.CurrentTerm(), r.leader, r.lastIncludedIndex, r.lastIncludedTerm, r.snapshot)
+			r.asyncInstallSnapshot(r.me, peer, req)
+		}
 	}
+}
+
+func (r *Raft) asyncSendAppendEntries(server int, peer int, req *AppendEntriesArgs) {
+	// async send AppendEntries RPC
+	go func(server int, peer int, req *AppendEntriesArgs) {
+		Debug("raft.asyncSendAppendEntries: server[%v] -> peer[%v] at term[%v] req[%v]", server, peer, req.Term, req)
+
+		var reply AppendEntriesReply
+		if ok := r.sendAppendEntries(peer, req, &reply); !ok {
+			Warning("raft.asyncSendAppendEntries: server[%v] -> peer[%v] at term[%v] timeout", server, peer, req.Term)
+			return
+		}
+
+		Debug("raft.asyncSendAppendEntries: server[%v] <- peer[%v] at term[%v] reply[%v]", server, peer, req.Term, reply)
+
+		// async send event to event center
+		target := &AppendEntriesReplyEvent{
+			Peer:  peer,
+			Req:   req,
+			Reply: &reply,
+		}
+		if !r.sendAsync(target) {
+			Warning("raft.asyncSendAppendEntries: server[%v] async send event failed", server)
+		}
+	}(server, peer, req)
+}
+
+func (r *Raft) asyncInstallSnapshot(server int, peer int, req *InstallSnapshotArgs) {
+	go func(server int, peer int, req *InstallSnapshotArgs) {
+		Debug("raft.asyncInstallSnapshot: server[%v] -> peer[%v] at term[%v] req[%v]", server, peer, req.Term, req)
+
+		var reply InstallSnapshotReply
+		if ok := r.sendInstallSnapshot(peer, req, &reply); !ok {
+			Warning("raft.asyncSendAppendEntries: server[%v] -> peer[%v] at term[%v] timeout", server, peer, req.Term)
+			return
+		}
+
+		Debug("raft.asyncInstallSnapshot: server[%v] <- peer[%v] at term[%v] reply[%v]", server, peer, req.Term, reply)
+
+		target := &InstallSnapshotReplyEvent{
+			Peer:  peer,
+			Req:   req,
+			Reply: &reply,
+		}
+		if !r.sendAsync(target) {
+			Warning("raft.asyncInstallSnapshot: server[%v] async send event failed", server)
+		}
+	}(r.me, peer, req)
 }
 
 // processAppendEntriesRequest process the "append entries" rpc request
@@ -1007,8 +1176,122 @@ func (r *Raft) processCommandRequest(req *CommandArgs) (*CommandReply, error) {
 	// save state to persist
 	r.persist()
 
-	Debug("raft.processCommandRequest: server[%v] append log entry[%v] success, log len[%v]", r.me, entry, len(r.log))
+	Debug("raft.processCommandRequest: server[%v] append log entry[%v] success, currentLogIndex[%v]",
+		r.me, entry, r.currentLogIndex())
 	return newCommandReply(entry.Index, entry.Term), nil
+}
+
+func (r *Raft) processSnapshot(req *SnapshotArgs) *SnapshotReply {
+	if req.Index <= r.lastIncludedIndex || req.Index > r.commitIndex {
+		Warning("raft.processSnapshot: server[%v] at term[%v] deny snapshot due to index[%v] not in(%v, %v]",
+			r.me, r.CurrentTerm(), req.Index, r.lastIncludedIndex, r.commitIndex)
+		return newSnapshotReply(false)
+	}
+
+	entry := r.getLogEntry(req.Index)
+	if entry == nil {
+		Warning("raft.processSnapshot: server[%v] at term[%v] deny snapshot due to index[%v] not found",
+			r.me, r.CurrentTerm(), req.Index)
+		return newSnapshotReply(false)
+	}
+
+	// compact log
+	r.compactLog(req.Index)
+
+	r.lastIncludedIndex = entry.Index
+	r.lastIncludedTerm = entry.Term
+	r.snapshot = req.Snapshot
+
+	// save raft state and snapshot to persist
+	r.persistStateAndSnapshot()
+
+	Debug("raft.processSnapshot: server[%v] at term[%v] snapshot index[%v] success", r.me, r.CurrentTerm(), req.Index)
+	return newSnapshotReply(true)
+}
+
+func (r *Raft) processCondInstallSnapshotRequest(req *CondInstallSnapshotArgs) *CondInstallSnapshotReply {
+	// 说明从InstallSnapshot到CondInstallSnapshot期间，有新的日志提交到状态机中
+	if req.LastIncludedIndex <= r.commitIndex {
+		Info("raft.processCondInstallSnapshotRequest: server[%v] at term[%v] cond install snapshot deny due to lastIncludedIndex[%v] <= commitIndex[%v]",
+			r.me, r.CurrentTerm(), req.LastIncludedIndex, r.commitIndex)
+		return newCondInstallSnapshotReply(false)
+	}
+
+	// 日志压缩
+	r.compactLog(req.LastIncludedIndex)
+
+	// 更新raft状态和snapshot
+	r.lastIncludedIndex = req.LastIncludedIndex
+	r.lastIncludedTerm = req.LastIncludedTerm
+	r.commitIndex = req.LastIncludedIndex
+	r.lastApplied = req.LastIncludedIndex
+	r.snapshot = req.Snapshot
+
+	// 持久化
+	r.persistStateAndSnapshot()
+
+	Debug("raft.processCondInstallSnapshotRequest: server[%v] at term[%v] cond install snapshot index[%v] success", r.me, r.CurrentTerm(), req.LastIncludedIndex)
+	return newCondInstallSnapshotReply(true)
+}
+
+func (r *Raft) processInstallSnapshotRequest(req *InstallSnapshotArgs) (*InstallSnapshotReply, bool) {
+	if req.Term > r.CurrentTerm() {
+		r.updateCurrentTerm(req.Term, req.LeaderId)
+	}
+
+	reply := newInstallSnapshotReply(r.CurrentTerm())
+	if req.Term < r.CurrentTerm() || req.LastIncludedIndex <= r.lastIncludedIndex {
+		Info("raft.processInstallSnapshotRequest: server[%v] at term[%v] deny install snapshot req[%v]",
+			r.me, r.CurrentTerm(), req)
+		return reply, true
+	}
+
+	// apply snapshot to state machine
+	msg := ApplyMsg{
+		SnapshotValid: true,
+		Snapshot:      req.Snapshot,
+		SnapshotTerm:  req.LastIncludedTerm,
+		SnapshotIndex: req.LastIncludedIndex,
+	}
+	r.applyQueue <- msg
+
+	Debug("raft.processInstallSnapshotRequest: server[%v] at term[%v] install snapshot success, req[%v]",
+		r.me, r.CurrentTerm(), req)
+	return reply, true
+}
+
+func (r *Raft) processInstallSnapshotReply(peer int, req *InstallSnapshotArgs, reply *InstallSnapshotReply) error {
+	if reply.Term < r.CurrentTerm() {
+		Info("raft.processInstallSnapshotReply: ignore reply due to peer[%v] term[%v] < server[%v] current term[%v]",
+			peer, reply.Term, r.
+				me, r.CurrentTerm())
+		return nil
+	}
+
+	if reply.Term > r.CurrentTerm() {
+		Info("raft.processInstallSnapshotReply: update term due to peer[%v] term[%v] > server[%v] current term[%v]",
+			peer, reply.Term, r.me, r.CurrentTerm())
+		r.updateCurrentTerm(reply.Term, LEADER_NONE)
+		return nil
+	}
+
+	// update peer nextIndex and matchIndex
+	r.nextIndex[peer] = req.LastIncludedIndex + 1
+	r.matchIndex[peer] = req.LastIncludedIndex
+
+	Debug("raft.processInstallSnapshotReply: server[%v] at term[%v] process install snapshot reply done. reply[%v]",
+		r.me, r.CurrentTerm(), reply)
+	return nil
+}
+
+func (r *Raft) processApplyMsg(applyMsg *ApplyMsg) {
+	if !applyMsg.CommandValid {
+		return
+	}
+
+	r.lastApplied = applyMsg.CommandIndex
+
+	Debug("raft.processApplyMsg: server[%v] at term[%v] apply index[%v] done", r.me, r.CurrentTerm(), r.lastApplied)
 }
 
 func (r *Raft) updateCurrentTerm(term int, leader int) {
@@ -1027,7 +1310,7 @@ func (r *Raft) updateCurrentTerm(term int, leader int) {
 // lastLogInfo return last log index and term
 func (r *Raft) lastLogInfo() (int, int) {
 	if len(r.log) == 0 {
-		return 0, 0
+		return r.lastIncludedIndex, r.lastIncludedTerm
 	}
 
 	lastEntry := r.log[len(r.log)-1]
@@ -1044,14 +1327,26 @@ func (r *Raft) createLogEntry(command interface{}) *LogEntry {
 }
 
 func (r *Raft) currentLogIndex() int {
-	if len(r.log) == 0 {
-		return 0
-	}
-	return r.log[len(r.log)-1].Index
+	lastLogIndex, _ := r.lastLogInfo()
+	return lastLogIndex
 }
 
 func (r *Raft) nextLogIndex() int {
 	return r.currentLogIndex() + 1
+}
+
+func (r *Raft) getInternalLogIndex(index int) int {
+	if index <= r.lastIncludedIndex || index > r.currentLogIndex() {
+		panic(fmt.Sprintf("index[%v] is out of range[%v..%v]", index, r.lastIncludedIndex, r.currentLogIndex()))
+	}
+	return index - r.lastIncludedIndex - 1
+}
+
+func (r *Raft) getLogEntry(index int) *LogEntry {
+	if index <= r.lastIncludedIndex || index > r.currentLogIndex() {
+		return nil
+	}
+	return r.log[r.getInternalLogIndex(index)]
 }
 
 func (r *Raft) appendLogEntries(entries []*LogEntry) error {
@@ -1069,16 +1364,14 @@ func (r *Raft) appendLogEntries(entries []*LogEntry) error {
 
 func (r *Raft) appendLogEntry(entry *LogEntry) error {
 	// Make sure the term and index are greater than the previous.
-	if len(r.log) > 0 {
-		lastEntry := r.log[len(r.log)-1]
-		if entry.Term < lastEntry.Term {
-			return fmt.Errorf("cannot append entry with earlier term")
-		} else if entry.Term == lastEntry.Term && entry.Index <= lastEntry.Index {
-			return fmt.Errorf("cannot append entry with earlier idnex")
-		}
+	lastLogIndex, lastLogTerm := r.lastLogInfo()
+	if entry.Term < lastLogTerm {
+		return fmt.Errorf("cannot append entry with earlier term")
+	} else if entry.Term == lastLogTerm && entry.Index <= lastLogIndex {
+		return fmt.Errorf("cannot append entry with earlier index")
 	}
 
-	// append to entry
+	// append log entry
 	r.log = append(r.log, entry)
 	return nil
 }
@@ -1087,21 +1380,21 @@ func (r *Raft) appendLogEntry(entry *LogEntry) error {
 // index provided.
 func (r *Raft) getLogEntriesAfter(index int, maxLogEntriesPerRequest int) ([]*LogEntry, int) {
 	// return nil if index is before the start of the log.
-	if index < 0 {
+	if index < r.lastIncludedIndex {
 		return nil, 0
 	}
 
 	// panic if the index doesn't exist.
-	if index > len(r.log) {
-		panic(fmt.Sprintf("raft.getLogEntriesAfter: index[%v] is out of log len[%v]", index, len(r.log)))
+	if index > r.currentLogIndex() {
+		panic(fmt.Sprintf("raft.getLogEntriesAfter: index[%v] is beyond currentLogIndex[%v]", index, r.currentLogIndex()))
 	}
 
-	if index == 0 {
-		return r.log, 0
+	if index == r.lastIncludedIndex {
+		return r.log, r.lastIncludedTerm
 	}
 
-	targetEntry := r.log[index-1]
-	afterEntries := r.log[index:]
+	targetEntry := r.getLogEntry(index)
+	afterEntries := r.log[r.getInternalLogIndex(index)+1:]
 	if len(afterEntries) > maxLogEntriesPerRequest {
 		afterEntries = afterEntries[:maxLogEntriesPerRequest]
 	}
@@ -1129,15 +1422,15 @@ func (r *Raft) truncateLog(index int, term int, entriesLen int) (int, int, error
 	}
 
 	// do not truncated non exists log entries
-	if index < 0 || index > len(r.log) {
-		// Debug("server[%v] at term[%v] index[%v] > r.log len[%v]", r.me, r.CurrentTerm(), index, len(r.log))
-		return r.currentLogIndex(), 0, fmt.Errorf("index[%v] with term[%v] out of range[0...%v]", index, term, len(r.log))
+	if index < r.lastIncludedIndex || index > r.currentLogIndex() {
+		return r.currentLogIndex(), 0, fmt.Errorf("index[%v] with term[%v] out of range[%v...%v]", index, term,
+			r.lastIncludedIndex, r.currentLogIndex())
 	}
 
 	// truncate all log entries
 	// 这种情况发生在，选出一个新leader后，leader中没有日志，发起AE RPC时，prevLogIndex=0，如果本节点已经被复制了一些日志，则这些日志会
 	// 被truncate掉
-	if index == 0 {
+	if index == r.lastIncludedIndex {
 		// only truncate is entries is not empty(means AE RPC is not for heartbeat)
 		if entriesLen > 0 {
 			r.log = []*LogEntry{}
@@ -1146,32 +1439,29 @@ func (r *Raft) truncateLog(index int, term int, entriesLen int) (int, int, error
 	}
 
 	// Do not truncate if the entry at index does not have the matching term.
-	entry := r.log[index-1]
+	entry := r.getLogEntry(index)
 	if entry.Term != term {
 		conflictIndex := r.searchTermFirstIndex(index, entry.Term)
 		return conflictIndex, entry.Term, fmt.Errorf("entry[%v %v] not match target term[%v]", index, term, entry.Term)
 	}
 
 	// otherwise truncate the disired entry.
-	r.log = r.log[:index]
+	r.log = r.log[:r.getInternalLogIndex(index)+1]
 	return 0, 0, nil
 }
 
 // search first log index in specified term
 func (r *Raft) searchTermFirstIndex(index int, term int) int {
-	if index <= 0 || index > len(r.log) {
-		return 0
-	}
-
-	targetIndex := r.log[index-1].Index
-	for i := index; i > 0; i-- {
-		entry := r.log[i-1]
+	startIndex := r.getInternalLogIndex(index)
+	firstLogIndex := r.log[startIndex].Index
+	for i := startIndex; i >= 0; i-- {
+		entry := r.log[i]
 		if entry.Term != term {
 			break
 		}
-		targetIndex = entry.Index
+		firstLogIndex = entry.Index
 	}
-	return targetIndex
+	return firstLogIndex
 }
 
 // search last entry in specified term, binary search right bound
@@ -1193,8 +1483,8 @@ func (r *Raft) searchTermLastEntry(term int) *LogEntry {
 
 func (r *Raft) setCommitIndex(leaderCommit int) error {
 	// if leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
-	if leaderCommit > len(r.log) {
-		leaderCommit = len(r.log)
+	if leaderCommit > r.currentLogIndex() {
+		leaderCommit = r.currentLogIndex()
 	}
 
 	// do not allow previous indices to be committed again.
@@ -1205,22 +1495,35 @@ func (r *Raft) setCommitIndex(leaderCommit int) error {
 	Debug("raft.setCommitIndex: server[%v] at term[%v] commit index from[%v] to[%v]",
 		r.me, r.CurrentTerm(), r.commitIndex+1, leaderCommit)
 
-	for i := r.commitIndex + 1; i <= leaderCommit; i++ {
-		entry := r.log[i-1]
+	for index := r.commitIndex + 1; index <= leaderCommit; index++ {
+		entry := r.getLogEntry(index)
 		r.commitIndex = entry.Index
 
-		// apply the changes to the state machine
+		// async apply the changes to the state machine
 		msg := ApplyMsg{
 			CommandValid: true,
 			Command:      entry.Command,
 			CommandIndex: entry.Index,
 		}
-		r.applyCh <- msg
-
-		// update lastApplied
-		r.lastApplied = r.commitIndex
+		r.applyQueue <- msg
 	}
 	return nil
+}
+
+// compactLog trim logs before index, include index
+func (r *Raft) compactLog(index int) {
+	// Usually the snapshot will contain new information not already in the recipient’s log.
+	// In this case, the follower discards its entire log;
+	entry := r.getLogEntry(index)
+	if entry == nil {
+		r.log = []*LogEntry{}
+		return
+	}
+
+	afterEntries := r.log[r.getInternalLogIndex(index)+1:]
+	newLog := make([]*LogEntry, len(afterEntries))
+	copy(newLog, afterEntries)
+	r.log = newLog
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -1242,11 +1545,15 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	// Your initialization code here (2A, 2B, 2C).
 	r.currentTerm = 0
 	r.votedFor = VOTED_FOR_NONE
+	r.lastIncludedIndex = 0
+	r.lastIncludedTerm = 0
+	r.snapshot = nil
 	r.log = make([]*LogEntry, 0)
 
 	r.leader = LEADER_NONE
 	r.state = Stopped
 	r.applyCh = applyCh
+	r.applyQueue = make(chan ApplyMsg, DefaultApplyQueueSize)
 
 	r.stopped = make(chan bool)
 	r.c = make(chan *event)
