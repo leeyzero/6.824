@@ -811,7 +811,7 @@ func (r *Raft) leaderLoop() {
 	lastLogIndex, _ := r.lastLogInfo()
 	for peer := range r.nextIndex {
 		r.nextIndex[peer] = lastLogIndex + 1
-		r.matchIndex[peer] = r.lastIncludedIndex
+		r.matchIndex[peer] = 0
 	}
 
 	// Once a candidate wins an election, it becomes leader. It then sends heartbeat message to all of the
