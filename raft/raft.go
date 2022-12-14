@@ -214,13 +214,7 @@ func newSnapshotReply(success bool) *SnapshotReply {
 }
 
 func newInstallSnapshotArgs(term int, leaderId int, lastIncludedIndex int, lastIncludedTerm int, snapshot []byte) *InstallSnapshotArgs {
-	return &InstallSnapshotArgs{
-		Term:              term,
-		LeaderId:          leaderId,
-		LastIncludedIndex: lastIncludedIndex,
-		LastIncludedTerm:  lastIncludedTerm,
-		Snapshot:          snapshot,
-	}
+	return &InstallSnapshotArgs{term, leaderId, lastIncludedIndex, lastIncludedTerm, snapshot}
 }
 
 func newInstallSnapshotReply(term int) *InstallSnapshotReply {
@@ -228,11 +222,7 @@ func newInstallSnapshotReply(term int) *InstallSnapshotReply {
 }
 
 func newCondInstallSnapshotArgs(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) *CondInstallSnapshotArgs {
-	return &CondInstallSnapshotArgs{
-		LastIncludedTerm:  lastIncludedTerm,
-		LastIncludedIndex: lastIncludedIndex,
-		Snapshot:          snapshot,
-	}
+	return &CondInstallSnapshotArgs{lastIncludedTerm, lastIncludedIndex, snapshot}
 }
 
 func newCondInstallSnapshotReply(success bool) *CondInstallSnapshotReply {
@@ -293,7 +283,7 @@ type Raft struct {
 // believes it is the leader.
 func (r *Raft) GetState() (int, bool) {
 	// Your code here (2A).
-	return r.CurrentTerm(), r.Me() == r.Leader()
+	return r.CurrentTerm(), r.State() == Leader
 }
 
 // save Raft's persistent state to stable storage,
@@ -584,18 +574,8 @@ func (r *Raft) CurrentTerm() int {
 	return r.currentTerm
 }
 
-func (r *Raft) Leader() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.leader
-}
-
 func (r *Raft) Me() int {
 	return r.me
-}
-
-func (r *Raft) VotedFor() int {
-	return r.votedFor
 }
 
 func (r *Raft) QuorumSize() int {
