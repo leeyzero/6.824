@@ -105,7 +105,6 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term          int
 	Success       bool
-	CommitIndex   int
 	ConflictIndex int
 	ConflictTerm  int
 }
@@ -193,8 +192,8 @@ func newAppendEntriesArgs(term int, leaderId int, prevLogIndex int, prevLogTerm 
 	return &AppendEntriesArgs{term, leaderId, prevLogIndex, prevLogTerm, leaderCommit, entries}
 }
 
-func newAppendEntriesReply(term int, success bool, commitIndex int, conflictIndex int, conflictTerm int) *AppendEntriesReply {
-	return &AppendEntriesReply{term, success, commitIndex, conflictIndex, conflictTerm}
+func newAppendEntriesReply(term int, success bool, conflictIndex int, conflictTerm int) *AppendEntriesReply {
+	return &AppendEntriesReply{term, success, conflictIndex, conflictTerm}
 }
 
 func newCommandArgs(command interface{}) *CommandArgs {
@@ -428,7 +427,6 @@ func (r *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)
 
 	reply.Term = 0
 	reply.Success = false
-	reply.CommitIndex = 0
 	reply.ConflictIndex = 0
 	reply.ConflictTerm = 0
 
@@ -445,7 +443,6 @@ func (r *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)
 
 	reply.Term = aeReply.Term
 	reply.Success = aeReply.Success
-	reply.CommitIndex = aeReply.CommitIndex
 	reply.ConflictIndex = aeReply.ConflictIndex
 	reply.ConflictTerm = aeReply.ConflictTerm
 }
@@ -982,7 +979,7 @@ func (r *Raft) processAppendEntriesRequest(req *AppendEntriesArgs) (*AppendEntri
 	// 1. Reply false if term < currentTerm (§5.1)
 	if req.Term < r.CurrentTerm() {
 		Info("raft.processAppendEntriesRequest: leader[%v] term[%v] staled, server[%v] current term[%v]", req.LeaderId, req.Term, r.me, r.CurrentTerm())
-		return newAppendEntriesReply(r.CurrentTerm(), false, r.commitIndex, 0, 0), false
+		return newAppendEntriesReply(r.CurrentTerm(), false, 0, 0), false
 	}
 
 	if req.Term > r.CurrentTerm() {
@@ -1005,13 +1002,13 @@ func (r *Raft) processAppendEntriesRequest(req *AppendEntriesArgs) (*AppendEntri
 	if conflictIndex, conflictTerm, err := r.truncateLog(req.PrevLogIndex, req.PrevLogTerm, len(req.Entries)); err != nil {
 		Info("raft.processAppendEntriesRequest: server[%v] truncateLog[%v %v] conflict[%v %v] err[%v]",
 			r.me, req.PrevLogIndex, req.PrevLogTerm, conflictIndex, conflictTerm, err)
-		return newAppendEntriesReply(r.CurrentTerm(), false, r.commitIndex, conflictIndex, conflictTerm), true
+		return newAppendEntriesReply(r.CurrentTerm(), false, conflictIndex, conflictTerm), true
 	}
 
 	// Append entries to the log.
 	if err := r.appendLogEntries(req.Entries); err != nil {
 		Info("raft.processAppendEntriesRequest: server[%v] appendLogEntries[%v] err[%v]", r.me, len(req.Entries), err)
-		return newAppendEntriesReply(r.CurrentTerm(), false, r.commitIndex, r.currentLogIndex(), 0), true
+		return newAppendEntriesReply(r.CurrentTerm(), false, r.currentLogIndex(), 0), true
 	}
 
 	// Save state to persist, skip heartbeat AE RPC
@@ -1022,11 +1019,11 @@ func (r *Raft) processAppendEntriesRequest(req *AppendEntriesArgs) (*AppendEntri
 	// Commit up to the commit index.
 	if err := r.setCommitIndex(req.LeaderCommit); err != nil {
 		Info("raft.processAppendEntriesRequest: server[%v] setCommitIndex[%v] err[%v]", r.me, req.LeaderCommit, err)
-		return newAppendEntriesReply(r.CurrentTerm(), false, r.commitIndex, r.currentLogIndex(), 0), true
+		return newAppendEntriesReply(r.CurrentTerm(), false, r.currentLogIndex(), 0), true
 	}
 
 	// Once the server appended and committed all the log entries from the leader
-	return newAppendEntriesReply(r.CurrentTerm(), true, r.commitIndex, 0, 0), true
+	return newAppendEntriesReply(r.CurrentTerm(), true, 0, 0), true
 }
 
 // processAppendEntriesReply process the append entries rpc reply
@@ -1055,12 +1052,7 @@ func (r *Raft) processAppendEntriesReply(peer int, req *AppendEntriesArgs, reply
 			}
 		}
 	} else if reply.Term == r.CurrentTerm() {
-
-		// If AppendEntries fails because of log inconsistency: decrement nextIndex and retry(§5.3)
-		prevLogIndex := r.getPrevLogIndex(peer)
-		if prevLogIndex < reply.CommitIndex {
-			r.nextIndex[peer] = reply.CommitIndex + 1
-		} else if reply.ConflictTerm > 0 {
+		if reply.ConflictTerm > 0 {
 			termLastEntry := r.searchTermLastEntry(reply.ConflictTerm)
 			if termLastEntry != nil {
 				r.nextIndex[peer] = termLastEntry.Index + 1
@@ -1070,15 +1062,10 @@ func (r *Raft) processAppendEntriesReply(peer int, req *AppendEntriesArgs, reply
 		} else {
 			conflictIndex := reply.ConflictIndex
 			if conflictIndex <= 0 {
-				// 这种情况发生在:
-				// term1: leader1复制日志到follower1
-				// term2: leader2选为主后，节点日志为空，将follower1中的日志truncate了
-				// term3: leader1再次选为主，由于nextIndex是记录term1中follower1复制的日志，follower1收到AE请求后，返回的conflictIndex将为0
-				// 此时将confictIndex重置为1，重新复制日志即可
+				// 发生这种情况估计是接收端出现BUG
 				conflictIndex = 1
 			}
 			r.nextIndex[peer] = conflictIndex
-
 		}
 
 		Info("raft.processAppendEntriesReply: server[%v] state[%v] at term[%v] recieved peer[%v] reply[%v] failed, peer nextIndex[%v]",
@@ -1398,12 +1385,12 @@ func (r *Raft) truncateLog(index int, term int, entriesLen int) (int, int, error
 	// follower收到第一个AE RPC，此时的prevLogIndex就会比commitIndex小
 	if index < r.commitIndex {
 		// Debug("server[%v] at term[%v] truncateLog index[%v] < r.commitIndex[%v]", r.me, r.CurrentTerm(), index, r.commitIndex)
-		return r.currentLogIndex(), 0, fmt.Errorf("index[%v] less than commmitted index[%v]", index, r.commitIndex)
+		return r.currentLogIndex() + 1, 0, fmt.Errorf("index[%v] less than commmitted index[%v]", index, r.commitIndex)
 	}
 
 	// do not truncated non exists log entries
 	if index < r.lastIncludedIndex || index > r.currentLogIndex() {
-		return r.currentLogIndex(), 0, fmt.Errorf("index[%v] with term[%v] out of range[%v...%v]", index, term,
+		return r.currentLogIndex() + 1, 0, fmt.Errorf("index[%v] with term[%v] out of range[%v...%v]", index, term,
 			r.lastIncludedIndex, r.currentLogIndex())
 	}
 
